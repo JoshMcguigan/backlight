@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "3.0.9", features = ["derive"] }
 goblin = "0.4"
 nix = "0.23"
 procfs = { version = "0.12", default-features = false }

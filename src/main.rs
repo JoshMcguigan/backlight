@@ -2,6 +2,7 @@ use std::{
     ffi::c_void, fs::read, io, mem, os::unix::prelude::CommandExt, path::PathBuf, process::Command,
 };
 
+use clap::Parser;
 use goblin::elf::Elf;
 use nix::{
     sys::{
@@ -11,6 +12,9 @@ use nix::{
     unistd::Pid,
 };
 use procfs::process::{MMapPath, Process};
+
+mod args;
+use args::Args;
 
 macro_rules! wait {
     ($pid:ident) => {
@@ -24,13 +28,22 @@ macro_rules! wait {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let (binary_to_trace, library_function_to_trace) = match args.command {
+        args::Command::Trace {
+            binary_to_trace,
+            library_function_to_trace,
+            ..
+        } => (binary_to_trace, library_function_to_trace),
+    };
+
     // --- Find symbol location in library ---
-    let malloc_virtual_addr_offset = find_malloc_address_offset()?;
+    let library_function_virtual_addr_offset =
+        find_library_function_address_offset(&library_function_to_trace)?;
 
     // --- Spawn tracee ---
     let pid = {
-        // TODO take this as arg
-        let mut c = Command::new("../hello/target/debug/hello");
+        let mut c = Command::new(&binary_to_trace);
         unsafe {
             c.pre_exec(|| {
                 ptrace::traceme().map_err(|err| io::Error::from_raw_os_error(err as i32))
@@ -73,9 +86,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let malloc_addr = libc_virtual_addr_base + malloc_virtual_addr_offset;
+    let library_function_addr = libc_virtual_addr_base + library_function_virtual_addr_offset;
 
-    let original_instruction = ptrace::read(pid, malloc_addr as *mut c_void)?;
+    let original_instruction = ptrace::read(pid, library_function_addr as *mut c_void)?;
     let modified_instruction = {
         let original_instruction = unsafe { mem::transmute::<i64, [u8; 8]>(original_instruction) };
         let mut m = original_instruction.clone();
@@ -87,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         ptrace::write(
             pid,
-            malloc_addr as *mut c_void,
+            library_function_addr as *mut c_void,
             modified_instruction as *mut c_void,
         )?;
     }
@@ -95,11 +108,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         ptrace::cont(pid, None)?;
         wait!(pid);
-        println!("called malloc");
+        println!("called {}", library_function_to_trace);
         unsafe {
             ptrace::write(
                 pid,
-                malloc_addr as *mut c_void,
+                library_function_addr as *mut c_void,
                 original_instruction as *mut c_void,
             )?;
         }
@@ -112,14 +125,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             ptrace::write(
                 pid,
-                malloc_addr as *mut c_void,
+                library_function_addr as *mut c_void,
                 modified_instruction as *mut c_void,
             )?;
         }
     }
 }
 
-fn find_malloc_address_offset() -> Result<u64, Box<dyn std::error::Error>> {
+fn find_library_function_address_offset(
+    library_function_to_trace: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    // TODO this should be passed as an arg to allow us checking any library which is
+    // linked in.
     let libc_bytes = read("/usr/lib/libc-2.33.so")?;
     let elf = Elf::parse(&libc_bytes)?;
 
@@ -135,7 +152,7 @@ fn find_malloc_address_offset() -> Result<u64, Box<dyn std::error::Error>> {
     }
     let text_section_index = text_section_info.ok_or("failed to find base addr")?;
 
-    let mut malloc_virtual_addr_offset = None;
+    let mut library_function_virtual_addr_offset = None;
     for symbol in elf.dynsyms.into_iter().filter(|s| {
         s.is_function()
                 // For now we only handle functions in the text section.
@@ -146,7 +163,7 @@ fn find_malloc_address_offset() -> Result<u64, Box<dyn std::error::Error>> {
             .get_at(symbol.st_name)
             .ok_or("failed to map symbol name")?;
 
-        if name == "malloc" {
+        if name == library_function_to_trace {
             let base_offset = elf
                 .program_headers
                 .iter()
@@ -160,20 +177,24 @@ fn find_malloc_address_offset() -> Result<u64, Box<dyn std::error::Error>> {
             // where this library is mapped into memory and where this function
             // is located.
             let virtual_addr_offset = symbol.st_value - base_offset;
-            malloc_virtual_addr_offset = Some(virtual_addr_offset);
+            library_function_virtual_addr_offset = Some(virtual_addr_offset);
         }
     }
-    let malloc_virtual_addr_offset = malloc_virtual_addr_offset.expect("didn't find malloc addr");
+    let library_function_virtual_addr_offset =
+        library_function_virtual_addr_offset.expect("didn't find library function addr");
 
-    Ok(malloc_virtual_addr_offset)
+    Ok(library_function_virtual_addr_offset)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::find_malloc_address_offset;
+    use super::find_library_function_address_offset;
 
     #[test]
-    fn finds_malloc_addr() {
-        assert_eq!(0x65320, find_malloc_address_offset().unwrap());
+    fn finds_library_function_addr() {
+        assert_eq!(
+            0x65320,
+            find_library_function_address_offset("malloc").unwrap()
+        );
     }
 }
