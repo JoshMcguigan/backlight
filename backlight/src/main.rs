@@ -225,7 +225,9 @@ fn find_library_function_address_offset(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, process::Command};
+
+    use expect_test::expect;
 
     use super::find_library_function_address_offset;
 
@@ -240,5 +242,34 @@ mod tests {
             .unwrap()
             .unwrap()
         );
+    }
+
+    #[test]
+    fn traces_single_library_call() {
+        let output = Command::new("cargo")
+            .args(&[
+                "run",
+                "--quiet",
+                "--bin",
+                "backlight",
+                "--",
+                "trace",
+                "../test_support/output/test_support_abs",
+                "-l",
+                "abs",
+            ])
+            .output()
+            .unwrap();
+
+        expect![[r#"
+            called abs
+            called abs
+            called abs
+            called abs
+            called abs
+            Child process exited
+        "#]]
+        .assert_eq(&String::from_utf8_lossy(&output.stdout));
+        expect![[r#""#]].assert_eq(&String::from_utf8_lossy(&output.stderr));
     }
 }
