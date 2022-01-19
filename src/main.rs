@@ -1,10 +1,5 @@
 use std::{
-    ffi::c_void,
-    fs::read,
-    io, mem,
-    os::unix::prelude::CommandExt,
-    path::{Path, PathBuf},
-    process::Command,
+    ffi::c_void, fs::read, io, mem, os::unix::prelude::CommandExt, path::Path, process::Command,
 };
 
 use clap::Parser;
@@ -17,7 +12,7 @@ use nix::{
     },
     unistd::Pid,
 };
-use procfs::process::{MMapPath, Process};
+use procfs::process::{FDTarget, MMapPath, Process};
 
 mod args;
 use args::Args;
@@ -46,9 +41,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => (binary_to_trace, library_function_to_trace),
     };
 
-    let library_function_virtual_addr_offset =
-        find_library_function_address_offset(&library_function_to_trace)?;
-
     let pid = spawn_tracee(&binary_to_trace)?;
 
     // The child reports being stopped by a SIGTRAP here.
@@ -58,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // At this point the shared libraries are not loaded. Watch for mmap
     // calls, indicating loading shared libraries.
-    let libc_virtual_addr_base: u64 = loop {
+    let (library_function_virtual_addr_offset, libc_virtual_addr_base) = loop {
         // Allow the tracee to advance to the next system call entrance or exit.
         ptrace::syscall(pid, None)?;
         wait!(pid);
@@ -66,15 +58,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let registers = ptrace::getregs(pid)?;
         if registers.rax == SYSCALL_ENTRY_MARKER && registers.orig_rax == SYS_CALL_MMAP {
             // TODO if not executable section continue loop
-            // TODO pull the memory map and path name from sys call args
+            let file_descriptor = registers.r8;
+            // We could watch for openat syscalls to get this mapping for ourselves
+            // rather than looking at procfs, but for now this is easier.
+            let file_path = if let Some(FDTarget::Path(file_path)) = procfs_process
+                .fd()?
+                .into_iter()
+                .find(|fd_info| fd_info.fd as u64 == file_descriptor)
+                .map(|fd_info| fd_info.target)
+            {
+                file_path
+            } else {
+                continue;
+            };
 
             // Allow the tracee to advance to the system call exit.
             //
             // We know it is the exit at this point because our last
             // wait was the entrance.
+            //
+            // TODO are there bugs here if there are other signals while this
+            // is happening?
             ptrace::syscall(pid, None)?;
             wait!(pid);
 
+            // If this file doesn't have our symbol we want to skip it.
+            let library_function_virtual_addr_offset = match find_library_function_address_offset(
+                &file_path,
+                &library_function_to_trace,
+            ) {
+                Ok(Some(a)) => a,
+                _ => continue,
+            };
+
+            let file_path = MMapPath::Path(file_path);
             // Check memory map for the new section.
             if let Some(mapped_address_space) =
                 procfs_process
@@ -82,8 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into_iter()
                     .find(|mapped_address_space| {
                         mapped_address_space.pathname
-                        // TODO pull this path from syscall args
-                        == MMapPath::Path(PathBuf::from("/usr/lib/libc-2.33.so"))
+                        == file_path
                         // How would we handle cases where multiple segments
                         // are mapped with executable permissions?
                         //
@@ -91,7 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && mapped_address_space.perms.contains('x')
                     })
             {
-                break mapped_address_space.address.0;
+                break (
+                    library_function_virtual_addr_offset,
+                    mapped_address_space.address.0,
+                );
             }
         }
     };
@@ -151,11 +170,10 @@ fn spawn_tracee(binary_to_trace: &Path) -> Result<Pid, Box<dyn std::error::Error
 }
 
 fn find_library_function_address_offset(
+    path_to_library: &Path,
     library_function_to_trace: &str,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    // TODO this should be passed as an arg to allow us checking any library which is
-    // linked in.
-    let libc_bytes = read("/usr/lib/libc-2.33.so")?;
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let libc_bytes = read(path_to_library)?;
     let elf = Elf::parse(&libc_bytes)?;
 
     let mut text_section_info = None;
@@ -190,7 +208,7 @@ fn find_library_function_address_offset(
                         && symbol.st_value < program_header.p_offset + program_header.p_memsz
                 })
                 .map(|program_header| program_header.p_offset)
-                .expect("didn't find mem mapped place");
+                .ok_or("didn't find mem mapped place")?;
             // This is the offset between the start of the executable section
             // where this library is mapped into memory and where this function
             // is located.
@@ -198,21 +216,25 @@ fn find_library_function_address_offset(
             library_function_virtual_addr_offset = Some(virtual_addr_offset);
         }
     }
-    let library_function_virtual_addr_offset =
-        library_function_virtual_addr_offset.expect("didn't find library function addr");
 
     Ok(library_function_virtual_addr_offset)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::find_library_function_address_offset;
 
     #[test]
     fn finds_library_function_addr() {
         assert_eq!(
             0x65320,
-            find_library_function_address_offset("malloc").unwrap()
+            // TODO find another way to test this to avoid relying on the existence
+            // of a particular version of libc on the developers machine
+            find_library_function_address_offset(&PathBuf::from("/usr/lib/libc-2.33.so"), "malloc")
+                .unwrap()
+                .unwrap()
         );
     }
 }
