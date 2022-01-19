@@ -232,12 +232,13 @@ mod tests {
     #[test]
     fn finds_library_function_addr() {
         assert_eq!(
-            0x65320,
-            // TODO find another way to test this to avoid relying on the existence
-            // of a particular version of libc on the developers machine
-            find_library_function_address_offset(&PathBuf::from("/usr/lib/libc-2.33.so"), "malloc")
-                .unwrap()
-                .unwrap()
+            0xf0,
+            find_library_function_address_offset(
+                &PathBuf::from("../test_support/output/libtest_support.so"),
+                "noop"
+            )
+            .unwrap()
+            .unwrap()
         );
     }
 }
