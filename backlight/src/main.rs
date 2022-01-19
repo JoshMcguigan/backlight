@@ -265,8 +265,6 @@ mod tests {
             called abs
             called abs
             called abs
-            called abs
-            called abs
             Child process exited
         "#]]
         .assert_eq(&String::from_utf8_lossy(&output.stdout));
