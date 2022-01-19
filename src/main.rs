@@ -120,6 +120,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_instruction = ptrace::read(pid, library_function_addr as *mut c_void)?;
     let modified_instruction = {
         let original_instruction = unsafe { mem::transmute::<i64, [u8; 8]>(original_instruction) };
+        // We want to be explicit here that we are taking a copy of the original
+        // instruction, rather than aliasing and then modifying the original.
+        #[allow(clippy::clone_on_copy)]
         let mut m = original_instruction.clone();
         m[0] = 0xcc;
 
