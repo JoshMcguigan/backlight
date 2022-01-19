@@ -227,7 +227,7 @@ fn find_library_function_address_offset(
 mod tests {
     use std::{path::PathBuf, process::Command};
 
-    use expect_test::expect;
+    use expect_test::{expect, Expect};
 
     use super::find_library_function_address_offset;
 
@@ -244,30 +244,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn traces_single_library_call() {
+    fn test_trace(trace_args: &[&str], expected_stdout: Expect, expected_stderr: Expect) {
         let output = Command::new("cargo")
-            .args(&[
-                "run",
-                "--quiet",
-                "--bin",
-                "backlight",
-                "--",
-                "trace",
-                "../test_support/output/test_support_abs",
-                "-l",
-                "abs",
-            ])
+            .args(&["run", "--quiet", "--bin", "backlight", "--", "trace"])
+            .args(trace_args)
             .output()
             .unwrap();
 
-        expect![[r#"
+        expected_stdout.assert_eq(&String::from_utf8_lossy(&output.stdout));
+        expected_stderr.assert_eq(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn traces_single_library_call() {
+        test_trace(
+            &["../test_support/output/test_support_abs", "-l", "abs"],
+            expect![[r#"
             called abs
             called abs
             called abs
             Child process exited
-        "#]]
-        .assert_eq(&String::from_utf8_lossy(&output.stdout));
-        expect![[r#""#]].assert_eq(&String::from_utf8_lossy(&output.stderr));
+            "#]],
+            expect![[r#""#]],
+        );
     }
 }
