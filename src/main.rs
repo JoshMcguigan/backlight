@@ -1,10 +1,16 @@
 use std::{
-    ffi::c_void, fs::read, io, mem, os::unix::prelude::CommandExt, path::PathBuf, process::Command,
+    ffi::c_void,
+    fs::read,
+    io, mem,
+    os::unix::prelude::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
 };
 
 use clap::Parser;
 use goblin::elf::Elf;
 use nix::{
+    errno::Errno,
     sys::{
         ptrace,
         wait::{waitpid, WaitStatus},
@@ -15,6 +21,9 @@ use procfs::process::{MMapPath, Process};
 
 mod args;
 use args::Args;
+
+const SYSCALL_ENTRY_MARKER: u64 = -(Errno::ENOSYS as i32) as u64;
+const SYS_CALL_MMAP: u64 = 9;
 
 macro_rules! wait {
     ($pid:ident) => {
@@ -37,20 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => (binary_to_trace, library_function_to_trace),
     };
 
-    // --- Find symbol location in library ---
     let library_function_virtual_addr_offset =
         find_library_function_address_offset(&library_function_to_trace)?;
 
-    // --- Spawn tracee ---
-    let pid = {
-        let mut c = Command::new(&binary_to_trace);
-        unsafe {
-            c.pre_exec(|| {
-                ptrace::traceme().map_err(|err| io::Error::from_raw_os_error(err as i32))
-            });
-        }
-        Pid::from_raw(c.spawn()?.id() as i32)
-    };
+    let pid = spawn_tracee(&binary_to_trace)?;
 
     // The child reports being stopped by a SIGTRAP here.
     wait!(pid);
@@ -62,27 +61,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let libc_virtual_addr_base: u64 = loop {
         // Allow the tracee to advance to the next system call entrance or exit.
         ptrace::syscall(pid, None)?;
-        // Wait for the tracee to signal.
         wait!(pid);
 
-        // We could optimize by only doing this after a mmap, but for now
-        // we check the memory map after each system call entrance/exit.
-        //
-        // This lookup should really happen for each mmap'ed shared library
-        // rather than hardcoding and only looking for libc.
-        if let Some(mapped_address_space) =
-            procfs_process
-                .maps()?
-                .into_iter()
-                .find(|mapped_address_space| {
-                    mapped_address_space.pathname
+        let registers = ptrace::getregs(pid)?;
+        if registers.rax == SYSCALL_ENTRY_MARKER && registers.orig_rax == SYS_CALL_MMAP {
+            // TODO if not executable section continue loop
+            // TODO pull the memory map and path name from sys call args
+
+            // Allow the tracee to advance to the system call exit.
+            //
+            // We know it is the exit at this point because our last
+            // wait was the entrance.
+            ptrace::syscall(pid, None)?;
+            wait!(pid);
+
+            // Check memory map for the new section.
+            if let Some(mapped_address_space) =
+                procfs_process
+                    .maps()?
+                    .into_iter()
+                    .find(|mapped_address_space| {
+                        mapped_address_space.pathname
+                        // TODO pull this path from syscall args
                         == MMapPath::Path(PathBuf::from("/usr/lib/libc-2.33.so"))
                         // How would we handle cases where multiple segments
                         // are mapped with executable permissions?
+                        //
+                        // TODO remove this by checking mmap call args
                         && mapped_address_space.perms.contains('x')
-                })
-        {
-            break mapped_address_space.address.0;
+                    })
+            {
+                break mapped_address_space.address.0;
+            }
         }
     };
 
@@ -130,6 +140,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
     }
+}
+
+fn spawn_tracee(binary_to_trace: &Path) -> Result<Pid, Box<dyn std::error::Error>> {
+    let mut c = Command::new(&binary_to_trace);
+    unsafe {
+        c.pre_exec(|| ptrace::traceme().map_err(|err| io::Error::from_raw_os_error(err as i32)));
+    }
+    Ok(Pid::from_raw(c.spawn()?.id() as i32))
 }
 
 fn find_library_function_address_offset(
