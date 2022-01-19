@@ -225,47 +225,59 @@ fn find_library_function_address_offset(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, process::Command};
+    use std::process::Command;
 
     use expect_test::{expect, Expect};
 
-    use super::find_library_function_address_offset;
-
-    #[test]
-    fn finds_library_function_addr() {
-        assert_eq!(
-            0xf0,
-            find_library_function_address_offset(
-                &PathBuf::from("../test_support/output/libtest_support.so"),
-                "noop"
-            )
-            .unwrap()
-            .unwrap()
-        );
-    }
-
-    fn test_trace(trace_args: &[&str], expected_stdout: Expect, expected_stderr: Expect) {
+    fn test_trace(trace_args: &[&str], expected: Expect) {
         let output = Command::new("cargo")
             .args(&["run", "--quiet", "--bin", "backlight", "--", "trace"])
             .args(trace_args)
             .output()
             .unwrap();
 
-        expected_stdout.assert_eq(&String::from_utf8_lossy(&output.stdout));
-        expected_stderr.assert_eq(&String::from_utf8_lossy(&output.stderr));
+        let result = format!(
+            "status code: {}\n\nstd out:\n{}\nstd err:\n{}\n",
+            match output.status.code() {
+                Some(c) => format!("{}", c),
+                None => "None".into(),
+            },
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        expected.assert_eq(&result);
+    }
+
+    fn cargo_build(bin_name: &str) {
+        let status = Command::new("cargo")
+            // cargo test sets the current working directory to the package
+            // root. We need to go up to the workspace root because this
+            // bin could be in a different package.
+            .current_dir("..")
+            .args(&["build", "--bin", bin_name])
+            .status()
+            .unwrap();
+
+        assert!(status.success());
     }
 
     #[test]
     fn traces_single_library_call() {
+        cargo_build("test_support_abs");
         test_trace(
-            &["../test_support/output/test_support_abs", "-l", "abs"],
+            &["../target/debug/test_support_abs", "-l", "abs"],
             expect![[r#"
-            called abs
-            called abs
-            called abs
-            Child process exited
+                status code: 0
+
+                std out:
+                called abs
+                called abs
+                called abs
+                Child process exited
+
+                std err:
+
             "#]],
-            expect![[r#""#]],
         );
     }
 }
