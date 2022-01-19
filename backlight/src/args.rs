@@ -11,6 +11,6 @@ pub enum Command {
     Trace {
         binary_to_trace: PathBuf,
         #[clap(short = 'l')]
-        library_function_to_trace: String,
+        library_functions_to_trace: Vec<String>,
     },
 }

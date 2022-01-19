@@ -23,22 +23,44 @@ const SYS_CALL_MMAP: u64 = 9;
 macro_rules! wait {
     ($pid:ident) => {
         if matches!(waitpid($pid, None)?, WaitStatus::Exited(_, _)) {
-            // We never found the shared library we were looking for and the
-            // child process exited.
             println!("Child process exited");
             return Ok(());
         }
     };
 }
 
+#[derive(Debug)]
+struct LibraryFunction {
+    name: String,
+    /// The virtual address where this function was loaded.
+    virtual_addr: u64,
+    original_instruction: i64,
+}
+
+impl LibraryFunction {
+    /// Returns the original instruction with the first byte replaced by int3
+    /// to trigger a trap.
+    fn modified_instruction(&self) -> i64 {
+        let original_instruction =
+            unsafe { mem::transmute::<i64, [u8; 8]>(self.original_instruction) };
+        // We want to be explicit here that we are taking a copy of the original
+        // instruction, rather than aliasing and then modifying the original.
+        #[allow(clippy::clone_on_copy)]
+        let mut m = original_instruction.clone();
+        m[0] = 0xcc;
+
+        unsafe { mem::transmute::<[u8; 8], i64>(m) }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let (binary_to_trace, library_function_to_trace) = match args.command {
+    let (binary_to_trace, mut library_functions_to_be_resolved) = match args.command {
         args::Command::Trace {
             binary_to_trace,
-            library_function_to_trace,
+            library_functions_to_trace,
             ..
-        } => (binary_to_trace, library_function_to_trace),
+        } => (binary_to_trace, library_functions_to_trace),
     };
 
     let pid = spawn_tracee(&binary_to_trace)?;
@@ -48,9 +70,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let procfs_process = Process::new(pid.as_raw())?;
 
+    let mut library_functions_to_trace = vec![];
+
     // At this point the shared libraries are not loaded. Watch for mmap
     // calls, indicating loading shared libraries.
-    let (library_function_virtual_addr_offset, libc_virtual_addr_base) = loop {
+    while !library_functions_to_be_resolved.is_empty() {
         // Allow the tracee to advance to the next system call entrance or exit.
         ptrace::syscall(pid, None)?;
         wait!(pid);
@@ -82,84 +106,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ptrace::syscall(pid, None)?;
             wait!(pid);
 
-            // If this file doesn't have our symbol we want to skip it.
-            let library_function_virtual_addr_offset = match find_library_function_address_offset(
-                &file_path,
-                &library_function_to_trace,
-            ) {
-                Ok(Some(a)) => a,
-                _ => continue,
-            };
+            library_functions_to_be_resolved = library_functions_to_be_resolved
+                .drain(..)
+                .filter(|library_function_to_trace| {
+                    // If this file doesn't have our symbol we want to skip it.
+                    let library_function_virtual_addr_offset =
+                        match find_library_function_address_offset(
+                            &file_path,
+                            library_function_to_trace,
+                        ) {
+                            Ok(Some(a)) => a,
+                            _ => return true,
+                        };
 
-            let file_path = MMapPath::Path(file_path);
-            // Check memory map for the new section.
-            if let Some(mapped_address_space) =
-                procfs_process
-                    .maps()?
-                    .into_iter()
-                    .find(|mapped_address_space| {
-                        mapped_address_space.pathname
+                    let file_path = MMapPath::Path(file_path.clone());
+                    // Check memory map for the new section.
+                    if let Some(mapped_address_space) = procfs_process
+                        .maps()
+                        .expect("failed to read memory map")
+                        .into_iter()
+                        .find(|mapped_address_space| {
+                            mapped_address_space.pathname
                         == file_path
                         // How would we handle cases where multiple segments
                         // are mapped with executable permissions?
                         //
                         // TODO remove this by checking mmap call args
                         && mapped_address_space.perms.contains('x')
-                    })
-            {
-                break (
-                    library_function_virtual_addr_offset,
-                    mapped_address_space.address.0,
-                );
-            }
+                        })
+                    {
+                        library_functions_to_trace.push(LibraryFunction {
+                            name: library_function_to_trace.into(),
+                            virtual_addr: library_function_virtual_addr_offset
+                                + mapped_address_space.address.0,
+                            original_instruction: 0,
+                        });
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
         }
-    };
+    }
 
-    let library_function_addr = libc_virtual_addr_base + library_function_virtual_addr_offset;
+    for library_function_info in library_functions_to_trace.iter_mut() {
+        let original_instruction =
+            ptrace::read(pid, library_function_info.virtual_addr as *mut c_void)?;
+        // Record the original instruction
+        library_function_info.original_instruction = original_instruction;
 
-    let original_instruction = ptrace::read(pid, library_function_addr as *mut c_void)?;
-    let modified_instruction = {
-        let original_instruction = unsafe { mem::transmute::<i64, [u8; 8]>(original_instruction) };
-        // We want to be explicit here that we are taking a copy of the original
-        // instruction, rather than aliasing and then modifying the original.
-        #[allow(clippy::clone_on_copy)]
-        let mut m = original_instruction.clone();
-        m[0] = 0xcc;
-
-        unsafe { mem::transmute::<[u8; 8], i64>(m) }
-    };
-
-    unsafe {
-        ptrace::write(
-            pid,
-            library_function_addr as *mut c_void,
-            modified_instruction as *mut c_void,
-        )?;
+        unsafe {
+            ptrace::write(
+                pid,
+                library_function_info.virtual_addr as *mut c_void,
+                library_function_info.modified_instruction() as *mut c_void,
+            )?;
+        }
     }
 
     loop {
         ptrace::cont(pid, None)?;
         wait!(pid);
-        println!("called {}", library_function_to_trace);
-        unsafe {
-            ptrace::write(
-                pid,
-                library_function_addr as *mut c_void,
-                original_instruction as *mut c_void,
-            )?;
-        }
-        // need to move pc back by 1 here
+        // Check instruction pointer to see which (if any) of our
+        // functions we are stopped at.
         let mut registers = ptrace::getregs(pid)?;
-        registers.rip -= 1;
-        ptrace::setregs(pid, registers)?;
-        ptrace::step(pid, None)?;
-        wait!(pid);
-        unsafe {
-            ptrace::write(
-                pid,
-                library_function_addr as *mut c_void,
-                modified_instruction as *mut c_void,
-            )?;
+        if let Some(traced_function) = library_functions_to_trace
+            .iter()
+            // When we stop, the instruction pointer will be on the instruction
+            // after our int3, so we subtrace one from the instruction pointer
+            // before doing the comparison.
+            .find(|f| f.virtual_addr == registers.rip - 1)
+        {
+            println!("called {}", &traced_function.name);
+            unsafe {
+                ptrace::write(
+                    pid,
+                    traced_function.virtual_addr as *mut c_void,
+                    traced_function.original_instruction as *mut c_void,
+                )?;
+            }
+            // need to move pc back by 1 here
+            registers.rip -= 1;
+            ptrace::setregs(pid, registers)?;
+            ptrace::step(pid, None)?;
+            wait!(pid);
+            unsafe {
+                ptrace::write(
+                    pid,
+                    traced_function.virtual_addr as *mut c_void,
+                    traced_function.modified_instruction() as *mut c_void,
+                )?;
+            }
         }
     }
 }
@@ -229,9 +267,12 @@ mod tests {
 
     use expect_test::{expect, Expect};
 
-    fn test_trace(trace_args: &[&str], expected: Expect) {
+    fn test_trace(bin_name: &str, trace_args: &[&str], expected: Expect) {
+        cargo_build(bin_name);
+
         let output = Command::new("cargo")
             .args(&["run", "--quiet", "--bin", "backlight", "--", "trace"])
+            .arg(&format!("../target/debug/{}", bin_name))
             .args(trace_args)
             .output()
             .unwrap();
@@ -263,15 +304,37 @@ mod tests {
 
     #[test]
     fn traces_single_library_call() {
-        cargo_build("test_support_abs");
         test_trace(
-            &["../target/debug/test_support_abs", "-l", "abs"],
+            "test_support_abs",
+            &["-l", "abs"],
             expect![[r#"
                 status code: 0
 
                 std out:
                 called abs
                 called abs
+                called abs
+                Child process exited
+
+                std err:
+
+            "#]],
+        );
+    }
+
+    #[test]
+    fn traces_multiple_library_calls() {
+        test_trace(
+            "test_support_abs",
+            &["-l", "abs", "-l", "labs"],
+            expect![[r#"
+                status code: 0
+
+                std out:
+                called abs
+                called labs
+                called abs
+                called labs
                 called abs
                 Child process exited
 
