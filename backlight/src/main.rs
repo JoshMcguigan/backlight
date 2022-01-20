@@ -1,5 +1,10 @@
 use std::{
-    ffi::c_void, fs::read, io, mem, os::unix::prelude::CommandExt, path::Path, process::Command,
+    ffi::c_void,
+    fs::read,
+    io,
+    os::unix::prelude::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
 };
 
 use clap::Parser;
@@ -7,55 +12,37 @@ use goblin::elf::Elf;
 use nix::{
     errno::Errno,
     sys::{
+        mman::ProtFlags,
         ptrace,
         wait::{waitpid, WaitStatus},
     },
     unistd::Pid,
 };
-use procfs::process::{FDTarget, MMapPath, Process};
+use procfs::process::{FDTarget, Process};
 
 mod args;
 use args::Args;
 
+mod resolved_function;
+use resolved_function::ResolvedFunction;
+
 const SYSCALL_ENTRY_MARKER: u64 = -(Errno::ENOSYS as i32) as u64;
 const SYS_CALL_MMAP: u64 = 9;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 macro_rules! wait {
     ($pid:ident) => {
         if matches!(waitpid($pid, None)?, WaitStatus::Exited(_, _)) {
-            println!("Child process exited");
+            println!("--- Child process exited ---");
             return Ok(());
         }
     };
 }
 
-#[derive(Debug)]
-struct LibraryFunction {
-    name: String,
-    /// The virtual address where this function was loaded.
-    virtual_addr: u64,
-    original_instruction: i64,
-}
-
-impl LibraryFunction {
-    /// Returns the original instruction with the first byte replaced by int3
-    /// to trigger a trap.
-    fn modified_instruction(&self) -> i64 {
-        let original_instruction =
-            unsafe { mem::transmute::<i64, [u8; 8]>(self.original_instruction) };
-        // We want to be explicit here that we are taking a copy of the original
-        // instruction, rather than aliasing and then modifying the original.
-        #[allow(clippy::clone_on_copy)]
-        let mut m = original_instruction.clone();
-        m[0] = 0xcc;
-
-        unsafe { mem::transmute::<[u8; 8], i64>(m) }
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     let args = Args::parse();
-    let (binary_to_trace, mut library_functions_to_be_resolved) = match args.command {
+    let (binary_to_trace, mut unresolved_functions) = match args.command {
         args::Command::Trace {
             binary_to_trace,
             library_functions_to_trace,
@@ -63,8 +50,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => (binary_to_trace, library_functions_to_trace),
     };
 
-    if library_functions_to_be_resolved.is_empty() {
-        library_functions_to_be_resolved = find_undefined_symbols(&binary_to_trace)?;
+    // If the user doesn't specify which functions they want to trace we
+    // trace everything.
+    if unresolved_functions.is_empty() {
+        unresolved_functions = find_undefined_symbols(&binary_to_trace)?;
     }
 
     let pid = spawn_tracee(&binary_to_trace)?;
@@ -74,31 +63,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let procfs_process = Process::new(pid.as_raw())?;
 
-    let mut library_functions_to_trace = vec![];
+    let mut resolved_functions = vec![];
 
     // At this point the shared libraries are not loaded. Watch for mmap
     // calls, indicating loading shared libraries.
     loop {
         // Allow the tracee to advance to the next system call entrance or exit.
+        //
+        // This will also stop for our INT3, or other signals.
         ptrace::syscall(pid, None)?;
         wait!(pid);
 
         let registers = ptrace::getregs(pid)?;
-        if registers.rax == SYSCALL_ENTRY_MARKER && registers.orig_rax == SYS_CALL_MMAP {
-            // TODO if not executable section continue loop
+        if registers.rax == SYSCALL_ENTRY_MARKER
+            && registers.orig_rax == SYS_CALL_MMAP
+            && ProtFlags::from_bits_truncate(registers.rdx as i32).contains(ProtFlags::PROT_EXEC)
+        {
             let file_descriptor = registers.r8;
             // We could watch for openat syscalls to get this mapping for ourselves
             // rather than looking at procfs, but for now this is easier.
-            let file_path = if let Some(FDTarget::Path(file_path)) = procfs_process
-                .fd()?
-                .into_iter()
-                .find(|fd_info| fd_info.fd as u64 == file_descriptor)
-                .map(|fd_info| fd_info.target)
-            {
-                file_path
-            } else {
-                continue;
-            };
+            let file_path =
+                if let Some(file_path) = get_file_path_from_fd(&procfs_process, file_descriptor)? {
+                    file_path
+                } else {
+                    continue;
+                };
+
+            let mmap_offset = registers.r9;
 
             // Allow the tracee to advance to the system call exit.
             //
@@ -110,41 +101,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ptrace::syscall(pid, None)?;
             wait!(pid);
 
-            library_functions_to_be_resolved = library_functions_to_be_resolved
+            let registers = ptrace::getregs(pid)?;
+            let mapped_virtual_address_base = registers.rax;
+
+            unresolved_functions = unresolved_functions
                 .drain(..)
                 .filter(|library_function_to_trace| {
                     // If this file doesn't have our symbol we want to skip it.
-                    let library_function_virtual_addr_offset =
-                        match find_library_function_address_offset(
-                            &file_path,
-                            library_function_to_trace,
-                        ) {
-                            Ok(Some(a)) => a,
+                    let (library_function_base_file_offset, library_function_virtual_addr_offset) =
+                        match find_library_function_addr_info(&file_path, library_function_to_trace)
+                        {
+                            Ok(Some((a, b))) => (a, b),
                             _ => return true,
                         };
 
-                    let file_path = MMapPath::Path(file_path.clone());
-                    // Check memory map for the new section.
-                    //
-                    // TODO get this info from the mmap call so we
-                    // don't have to wait for syscall exit.
-                    if let Some(mapped_address_space) = procfs_process
-                        .maps()
-                        .expect("failed to read memory map")
-                        .into_iter()
-                        .find(|mapped_address_space| {
-                            mapped_address_space.pathname
-                        == file_path
-                        // How would we handle cases where multiple segments
-                        // are mapped with executable permissions?
-                        //
-                        // TODO remove this by checking mmap call args
-                        && mapped_address_space.perms.contains('x')
-                        })
-                    {
+                    if library_function_base_file_offset == mmap_offset {
                         let virtual_addr =
-                            library_function_virtual_addr_offset + mapped_address_space.address.0;
-                        let library_function = LibraryFunction {
+                            library_function_virtual_addr_offset + mapped_virtual_address_base;
+                        let library_function = ResolvedFunction {
                             name: library_function_to_trace.into(),
                             virtual_addr,
                             original_instruction: ptrace::read(pid, virtual_addr as *mut c_void)
@@ -158,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .unwrap();
                         }
-                        library_functions_to_trace.push(library_function);
+                        resolved_functions.push(library_function);
                         false
                     } else {
                         true
@@ -169,14 +143,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Rebind as mut, because the if-block above does not mutate the registers
             // but this block does.
             let mut registers = registers;
-            if let Some(traced_function) = library_functions_to_trace
+            if let Some(traced_function) = resolved_functions
                 .iter()
                 // When we stop, the instruction pointer will be on the instruction
-                // after our int3, so we subtrace one from the instruction pointer
+                // after our int3, so we subtract one from the instruction pointer
                 // before doing the comparison.
                 .find(|f| f.virtual_addr == registers.rip - 1)
             {
-                println!("called {}", &traced_function.name);
+                println!("{}", &traced_function.name);
                 unsafe {
                     ptrace::write(
                         pid,
@@ -201,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn spawn_tracee(binary_to_trace: &Path) -> Result<Pid, Box<dyn std::error::Error>> {
+fn spawn_tracee(binary_to_trace: &Path) -> Result<Pid> {
     let mut c = Command::new(&binary_to_trace);
     unsafe {
         c.pre_exec(|| ptrace::traceme().map_err(|err| io::Error::from_raw_os_error(err as i32)));
@@ -209,10 +183,14 @@ fn spawn_tracee(binary_to_trace: &Path) -> Result<Pid, Box<dyn std::error::Error
     Ok(Pid::from_raw(c.spawn()?.id() as i32))
 }
 
-fn find_library_function_address_offset(
+/// If the library function is found in this library, this function returns a tuple of
+///   * base address in the file of the segment containing this function
+///   * virtual address offset - the number of bytes from the base virtual address
+///     where that segment is mapped to this function
+fn find_library_function_addr_info(
     path_to_library: &Path,
     library_function_to_trace: &str,
-) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+) -> Result<Option<(u64, u64)>> {
     let library_bytes = read(path_to_library)?;
     let elf = Elf::parse(&library_bytes)?;
 
@@ -228,7 +206,7 @@ fn find_library_function_address_offset(
     }
     let text_section_index = text_section_info.ok_or("failed to find base addr")?;
 
-    let mut library_function_virtual_addr_offset = None;
+    let mut library_function_addr_info = None;
     for symbol in elf.dynsyms.into_iter().filter(|s| {
         s.is_function()
                 // For now we only handle functions in the text section.
@@ -253,16 +231,16 @@ fn find_library_function_address_offset(
             // where this library is mapped into memory and where this function
             // is located.
             let virtual_addr_offset = symbol.st_value - base_offset;
-            library_function_virtual_addr_offset = Some(virtual_addr_offset);
+            library_function_addr_info = Some((base_offset, virtual_addr_offset));
         }
     }
 
-    Ok(library_function_virtual_addr_offset)
+    Ok(library_function_addr_info)
 }
 
 /// This function returns all undefined symbols, representing functions, in the
 /// given elf. Undefined symbols in a binary will be dynamically linked.
-fn find_undefined_symbols(path_to_bin: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn find_undefined_symbols(path_to_bin: &Path) -> Result<Vec<String>> {
     let library_bytes = read(path_to_bin)?;
     let elf = Elf::parse(&library_bytes)?;
     let mut out = vec![];
@@ -284,6 +262,22 @@ fn find_undefined_symbols(path_to_bin: &Path) -> Result<Vec<String>, Box<dyn std
     Ok(out)
 }
 
+fn get_file_path_from_fd(
+    procfs_process: &Process,
+    file_descriptor: u64,
+) -> Result<Option<PathBuf>> {
+    if let Some(FDTarget::Path(file_path)) = procfs_process
+        .fd()?
+        .into_iter()
+        .find(|fd_info| fd_info.fd as u64 == file_descriptor)
+        .map(|fd_info| fd_info.target)
+    {
+        Ok(Some(file_path))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, process::Command};
@@ -293,10 +287,11 @@ mod tests {
     use crate::find_undefined_symbols;
 
     fn test_trace(bin_name: &str, trace_args: &[&str], expected: Expect) {
+        cargo_build("backlight");
         cargo_build(bin_name);
 
-        let output = Command::new("cargo")
-            .args(&["run", "--quiet", "--bin", "backlight", "--", "trace"])
+        let output = Command::new("../target/debug/backlight")
+            .arg("trace")
             .arg(&format!("../target/debug/{}", bin_name))
             .args(trace_args)
             .output()
@@ -336,10 +331,10 @@ mod tests {
                 status code: 0
 
                 std out:
-                called abs
-                called abs
-                called abs
-                Child process exited
+                abs
+                abs
+                abs
+                --- Child process exited ---
 
                 std err:
 
@@ -356,12 +351,12 @@ mod tests {
                 status code: 0
 
                 std out:
-                called abs
-                called labs
-                called abs
-                called labs
-                called abs
-                Child process exited
+                abs
+                labs
+                abs
+                labs
+                abs
+                --- Child process exited ---
 
                 std err:
 
@@ -378,68 +373,68 @@ mod tests {
                 status code: 0
 
                 std out:
-                called __libc_start_main
-                called poll
-                called signal
-                called sigaction
-                called sigaction
-                called sigaction
-                called sigaction
-                called sigaction
-                called sigaltstack
-                called sysconf
-                called mmap
-                called sysconf
-                called mprotect
-                called sysconf
-                called sigaltstack
-                called sysconf
-                called pthread_self
-                called pthread_getattr_np
-                called malloc
-                called malloc
-                called malloc
-                called fstat64
-                called malloc
-                called realloc
-                called realloc
-                called free
-                called free
-                called free
-                called realloc
-                called malloc
-                called calloc
-                called realloc
-                called malloc
-                called free
-                called pthread_attr_getstack
-                called pthread_attr_destroy
-                called free
-                called free
-                called malloc
-                called pthread_mutex_lock
-                called pthread_mutex_unlock
-                called malloc
-                called __cxa_thread_atexit_impl
-                called calloc
-                called abs
-                called labs
-                called abs
-                called labs
-                called abs
-                called sigaltstack
-                called sysconf
-                called sysconf
-                called munmap
-                called free
-                called free
-                called free
-                called __cxa_finalize
-                called __cxa_finalize
-                called __cxa_finalize
-                called __cxa_finalize
-                called __cxa_finalize
-                Child process exited
+                __libc_start_main
+                poll
+                signal
+                sigaction
+                sigaction
+                sigaction
+                sigaction
+                sigaction
+                sigaltstack
+                sysconf
+                mmap
+                sysconf
+                mprotect
+                sysconf
+                sigaltstack
+                sysconf
+                pthread_self
+                pthread_getattr_np
+                malloc
+                malloc
+                malloc
+                fstat64
+                malloc
+                realloc
+                realloc
+                free
+                free
+                free
+                realloc
+                malloc
+                calloc
+                realloc
+                malloc
+                free
+                pthread_attr_getstack
+                pthread_attr_destroy
+                free
+                free
+                malloc
+                pthread_mutex_lock
+                pthread_mutex_unlock
+                malloc
+                __cxa_thread_atexit_impl
+                calloc
+                abs
+                labs
+                abs
+                labs
+                abs
+                sigaltstack
+                sysconf
+                sysconf
+                munmap
+                free
+                free
+                free
+                __cxa_finalize
+                __cxa_finalize
+                __cxa_finalize
+                __cxa_finalize
+                __cxa_finalize
+                --- Child process exited ---
 
                 std err:
 
