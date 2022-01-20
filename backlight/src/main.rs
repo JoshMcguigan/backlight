@@ -27,6 +27,9 @@ use args::Args;
 mod resolved_function;
 use resolved_function::ResolvedFunction;
 
+mod syscall;
+use syscall::syscall_name;
+
 const SYSCALL_ENTRY_MARKER: u64 = -(Errno::ENOSYS as i32) as u64;
 const SYS_CALL_MMAP: u64 = 9;
 
@@ -37,6 +40,7 @@ struct Tracee {
     procfs: procfs::process::Process,
     unresolved_functions: Vec<String>,
     resolved_functions: Vec<ResolvedFunction>,
+    syscalls_to_trace: SyscallsToTrace,
     /// If we've seen the entry to a mmap syscall but not the exit
     /// we store the args here. Upon exit we resolve functions
     /// and set this back to None.
@@ -62,10 +66,19 @@ enum TraceeState {
     Exited,
 }
 
+enum SyscallsToTrace {
+    All,
+    /// Names of the syscalls the user would like to trace.
+    ///
+    /// This can be empty, in which case we will not trace any syscalls.
+    These(Vec<String>),
+}
+
 impl Tracee {
     fn init(
         binary_to_trace: &Path,
         library_functions_to_trace: Vec<String>,
+        syscalls_to_trace: SyscallsToTrace,
     ) -> Result<TraceeState> {
         let pid = spawn_tracee(binary_to_trace)?;
 
@@ -81,6 +94,7 @@ impl Tracee {
                 procfs: Process::new(pid.as_raw())?,
                 unresolved_functions: library_functions_to_trace,
                 resolved_functions: vec![],
+                syscalls_to_trace,
                 mmap_in_progress: None,
                 int3_trap_in_progress: None,
             }))
@@ -100,6 +114,24 @@ impl Tracee {
             WaitStatus::Exited(_, _) => Ok(TraceeState::Exited),
             WaitStatus::PtraceSyscall(_pid) => {
                 let registers = ptrace::getregs(self.pid)?;
+                if registers.rax == SYSCALL_ENTRY_MARKER {
+                    let name = syscall_name(registers.orig_rax)
+                        .map(|s| s.to_string())
+                        .unwrap_or(format!("SYS_UNKNOWN_{}", registers.orig_rax));
+
+                    let should_trace = match &self.syscalls_to_trace {
+                        SyscallsToTrace::All => true,
+                        SyscallsToTrace::These(syscalls_to_trace)
+                            if syscalls_to_trace.contains(&name) =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if should_trace {
+                        println!("[sys] {}", name);
+                    }
+                }
                 if registers.rax == SYSCALL_ENTRY_MARKER
                     && registers.orig_rax == SYS_CALL_MMAP
                     && ProtFlags::from_bits_truncate(registers.rdx as i32)
@@ -209,7 +241,7 @@ impl Tracee {
             // before doing the comparison.
             .find(|f| f.virtual_addr == registers.rip - 1)
         {
-            println!("{}", &traced_function.name);
+            println!("[lib] {}", &traced_function.name);
             unsafe {
                 ptrace::write(
                     self.pid,
@@ -235,21 +267,38 @@ impl Tracee {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let (binary_to_trace, mut library_functions_to_trace) = match args.command {
+    let (binary_to_trace, library_functions_to_trace, syscalls_to_trace) = match args.command {
         args::Command::Trace {
             binary_to_trace,
             library_functions_to_trace,
+            syscalls_to_trace,
             ..
-        } => (binary_to_trace, library_functions_to_trace),
+        } => (
+            binary_to_trace,
+            library_functions_to_trace,
+            syscalls_to_trace,
+        ),
     };
 
-    // If the user doesn't specify which functions they want to trace we
-    // trace everything.
-    if library_functions_to_trace.is_empty() {
-        library_functions_to_trace = find_undefined_symbols(&binary_to_trace)?;
-    }
+    // If the user doesn't specify what they want to trace we trace everything.
+    let (library_functions_to_trace, syscalls_to_trace) =
+        if library_functions_to_trace.is_empty() && syscalls_to_trace.is_empty() {
+            (
+                find_undefined_symbols(&binary_to_trace)?,
+                SyscallsToTrace::All,
+            )
+        } else {
+            (
+                library_functions_to_trace,
+                SyscallsToTrace::These(syscalls_to_trace),
+            )
+        };
 
-    let mut tracee = match Tracee::init(&binary_to_trace, library_functions_to_trace)? {
+    let mut tracee = match Tracee::init(
+        &binary_to_trace,
+        library_functions_to_trace,
+        syscalls_to_trace,
+    )? {
         TraceeState::Alive(t) => t,
         TraceeState::Exited => {
             println!("--- Child process exited ---");
@@ -424,9 +473,9 @@ mod tests {
                 status code: 0
 
                 std out:
-                abs
-                abs
-                abs
+                [lib] abs
+                [lib] abs
+                [lib] abs
                 --- Child process exited ---
 
                 std err:
@@ -444,11 +493,11 @@ mod tests {
                 status code: 0
 
                 std out:
-                abs
-                labs
-                abs
-                labs
-                abs
+                [lib] abs
+                [lib] labs
+                [lib] abs
+                [lib] labs
+                [lib] abs
                 --- Child process exited ---
 
                 std err:
@@ -458,7 +507,71 @@ mod tests {
     }
 
     #[test]
-    fn traces_all_library_calls() {
+    fn traces_single_syscall() {
+        test_trace(
+            "test_support_abs",
+            &["-s", "sys_brk"],
+            expect![[r#"
+                status code: 0
+
+                std out:
+                [sys] sys_brk
+                [sys] sys_brk
+                [sys] sys_brk
+                --- Child process exited ---
+
+                std err:
+
+            "#]],
+        );
+    }
+
+    #[test]
+    fn traces_multiple_syscalls() {
+        test_trace(
+            "test_support_abs",
+            &["-s", "sys_brk", "-s", "sys_exit_group"],
+            expect![[r#"
+                status code: 0
+
+                std out:
+                [sys] sys_brk
+                [sys] sys_brk
+                [sys] sys_brk
+                [sys] sys_exit_group
+                --- Child process exited ---
+
+                std err:
+
+            "#]],
+        );
+    }
+
+    #[test]
+    fn traces_syscall_and_library_function() {
+        test_trace(
+            "test_support_abs",
+            &["-s", "sys_brk", "-l", "abs"],
+            expect![[r#"
+                status code: 0
+
+                std out:
+                [sys] sys_brk
+                [sys] sys_brk
+                [sys] sys_brk
+                [lib] abs
+                [lib] abs
+                [lib] abs
+                --- Child process exited ---
+
+                std err:
+
+            "#]],
+        );
+    }
+
+    #[test]
+    fn traces_all_by_default() {
         test_trace(
             "test_support_abs",
             &[],
@@ -466,67 +579,264 @@ mod tests {
                 status code: 0
 
                 std out:
-                __libc_start_main
-                poll
-                signal
-                sigaction
-                sigaction
-                sigaction
-                sigaction
-                sigaction
-                sigaltstack
-                sysconf
-                mmap
-                sysconf
-                mprotect
-                sysconf
-                sigaltstack
-                sysconf
-                pthread_self
-                pthread_getattr_np
-                malloc
-                malloc
-                malloc
-                fstat64
-                malloc
-                realloc
-                realloc
-                free
-                free
-                free
-                realloc
-                malloc
-                calloc
-                realloc
-                malloc
-                free
-                pthread_attr_getstack
-                pthread_attr_destroy
-                free
-                free
-                malloc
-                pthread_mutex_lock
-                pthread_mutex_unlock
-                malloc
-                __cxa_thread_atexit_impl
-                calloc
-                abs
-                labs
-                abs
-                labs
-                abs
-                sigaltstack
-                sysconf
-                sysconf
-                munmap
-                free
-                free
-                free
-                __cxa_finalize
-                __cxa_finalize
-                __cxa_finalize
-                __cxa_finalize
-                __cxa_finalize
+                [sys] sys_brk
+                [sys] sys_arch_prctl
+                [sys] sys_mmap
+                [sys] sys_access
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_openat
+                [sys] sys_newfstatat
+                [sys] sys_mmap
+                [sys] sys_close
+                [sys] sys_openat
+                [sys] sys_read
+                [sys] sys_pread64
+                [sys] sys_pread64
+                [sys] sys_pread64
+                [sys] sys_newfstatat
+                [sys] sys_pread64
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_close
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_read
+                [sys] sys_newfstatat
+                [sys] sys_mmap
+                [sys] sys_mprotect
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_close
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_read
+                [sys] sys_pread64
+                [sys] sys_pread64
+                [sys] sys_newfstatat
+                [sys] sys_mmap
+                [sys] sys_mprotect
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_close
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_read
+                [sys] sys_newfstatat
+                [sys] sys_mmap
+                [sys] sys_mprotect
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_close
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_openat
+                [sys] sys_read
+                [sys] sys_newfstatat
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_close
+                [sys] sys_mmap
+                [sys] sys_mmap
+                [sys] sys_arch_prctl
+                [sys] sys_mprotect
+                [sys] sys_mprotect
+                [sys] sys_mprotect
+                [sys] sys_mprotect
+                [sys] sys_mprotect
+                [sys] sys_mprotect
+                [sys] sys_mprotect
+                [sys] sys_munmap
+                [sys] sys_set_tid_address
+                [sys] sys_set_robust_list
+                [sys] sys_rt_sigaction
+                [sys] sys_rt_sigaction
+                [sys] sys_rt_sigprocmask
+                [sys] sys_prlimit64
+                [lib] __libc_start_main
+                [lib] poll
+                [sys] sys_poll
+                [lib] signal
+                [lib] sigaction
+                [sys] sys_rt_sigaction
+                [lib] sigaction
+                [sys] sys_rt_sigaction
+                [lib] sigaction
+                [sys] sys_rt_sigaction
+                [lib] sigaction
+                [sys] sys_rt_sigaction
+                [lib] sigaction
+                [sys] sys_rt_sigaction
+                [lib] sigaltstack
+                [sys] sys_sigaltstack
+                [lib] sysconf
+                [lib] mmap
+                [sys] sys_mmap
+                [lib] sysconf
+                [lib] mprotect
+                [sys] sys_mprotect
+                [lib] sysconf
+                [lib] sigaltstack
+                [sys] sys_sigaltstack
+                [lib] sysconf
+                [lib] pthread_self
+                [lib] pthread_getattr_np
+                [lib] malloc
+                [lib] malloc
+                [sys] sys_brk
+                [sys] sys_brk
+                [sys] sys_openat
+                [sys] sys_prlimit64
+                [lib] malloc
+                [lib] fstat64
+                [sys] sys_newfstatat
+                [lib] malloc
+                [sys] sys_read
+                [lib] realloc
+                [lib] realloc
+                [sys] sys_read
+                [sys] sys_read
+                [sys] sys_read
+                [sys] sys_read
+                [lib] free
+                [sys] sys_close
+                [lib] free
+                [lib] free
+                [lib] realloc
+                [lib] malloc
+                [sys] sys_sched_getaffinity
+                [lib] calloc
+                [lib] realloc
+                [lib] malloc
+                [lib] free
+                [lib] pthread_attr_getstack
+                [lib] pthread_attr_destroy
+                [lib] free
+                [lib] free
+                [lib] malloc
+                [lib] pthread_mutex_lock
+                [lib] pthread_mutex_unlock
+                [lib] malloc
+                [lib] __cxa_thread_atexit_impl
+                [lib] calloc
+                [lib] abs
+                [lib] labs
+                [lib] abs
+                [lib] labs
+                [lib] abs
+                [lib] sigaltstack
+                [sys] sys_sigaltstack
+                [lib] sysconf
+                [lib] sysconf
+                [lib] munmap
+                [sys] sys_munmap
+                [lib] free
+                [lib] free
+                [lib] free
+                [lib] __cxa_finalize
+                [lib] __cxa_finalize
+                [lib] __cxa_finalize
+                [lib] __cxa_finalize
+                [lib] __cxa_finalize
+                [sys] sys_exit_group
                 --- Child process exited ---
 
                 std err:
