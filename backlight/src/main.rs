@@ -32,14 +32,6 @@ const SYS_CALL_MMAP: u64 = 9;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-macro_rules! wait {
-    ($pid:expr) => {
-        if matches!(waitpid($pid, None)?, WaitStatus::Exited(_, _)) {
-            return Ok(TraceeState::Exited);
-        }
-    };
-}
-
 struct Tracee {
     pid: Pid,
     procfs: procfs::process::Process,
@@ -49,6 +41,7 @@ struct Tracee {
     /// we store the args here. Upon exit we resolve functions
     /// and set this back to None.
     mmap_in_progress: Option<MmapArgs>,
+    int3_trap_in_progress: Option<Int3TrapInProgress>,
 }
 
 struct MmapArgs {
@@ -56,6 +49,11 @@ struct MmapArgs {
     file_path: PathBuf,
     /// Offset into the file where the mapping starts.
     offset: u64,
+}
+
+struct Int3TrapInProgress {
+    addr: u64,
+    instruction: i64,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -71,6 +69,7 @@ impl Tracee {
     ) -> Result<TraceeState> {
         let pid = spawn_tracee(binary_to_trace)?;
 
+        // This allows distinguishing traps for sys calls from other traps.
         ptrace::setoptions(pid, ptrace::Options::PTRACE_O_TRACESYSGOOD)?;
 
         // The tracee should signal a SIGTRAP here.
@@ -83,11 +82,20 @@ impl Tracee {
                 unresolved_functions: library_functions_to_trace,
                 resolved_functions: vec![],
                 mmap_in_progress: None,
+                int3_trap_in_progress: None,
             }))
         }
     }
     fn step(mut self) -> Result<TraceeState> {
-        ptrace::syscall(self.pid, None)?;
+        // If we are in the middle of the int3 trap process, then we've
+        // written the original instruction and we want to single step
+        // until we are past it so we can write the modified instruction
+        // again.
+        if self.int3_trap_in_progress.is_some() {
+            ptrace::step(self.pid, None)?;
+        } else {
+            ptrace::syscall(self.pid, None)?;
+        }
         match waitpid(self.pid, None)? {
             WaitStatus::Exited(_, _) => Ok(TraceeState::Exited),
             WaitStatus::PtraceSyscall(_pid) => {
@@ -111,7 +119,24 @@ impl Tracee {
             }
             _ => {
                 let registers = ptrace::getregs(self.pid)?;
-                self.handle_trap(registers)
+                if let Some(int3_trap_in_progress) = self.int3_trap_in_progress.take() {
+                    if registers.rip == int3_trap_in_progress.addr {
+                        // We haven't moved past this instruction yet. This is still
+                        // in progress so we put it back.
+                        self.int3_trap_in_progress = Some(int3_trap_in_progress);
+                    } else {
+                        unsafe {
+                            ptrace::write(
+                                self.pid,
+                                int3_trap_in_progress.addr as *mut c_void,
+                                int3_trap_in_progress.instruction as *mut c_void,
+                            )?;
+                        }
+                    }
+                } else {
+                    self.handle_trap(registers)?;
+                }
+                Ok(TraceeState::Alive(self))
             }
         }
     }
@@ -175,7 +200,7 @@ impl Tracee {
 
         Ok(())
     }
-    fn handle_trap(self, mut registers: user_regs_struct) -> Result<TraceeState> {
+    fn handle_trap(&mut self, mut registers: user_regs_struct) -> Result<()> {
         if let Some(traced_function) = self
             .resolved_functions
             .iter()
@@ -195,18 +220,16 @@ impl Tracee {
             // need to move pc back by 1 here
             registers.rip -= 1;
             ptrace::setregs(self.pid, registers)?;
-            ptrace::step(self.pid, None)?;
-            wait!(self.pid);
-            unsafe {
-                ptrace::write(
-                    self.pid,
-                    traced_function.virtual_addr as *mut c_void,
-                    traced_function.modified_instruction() as *mut c_void,
-                )?;
-            }
-        }
 
-        Ok(TraceeState::Alive(self))
+            // Setting this trap in progress tells Self::step to single
+            // step until we move past this address and can write the
+            // modified instruction back into its place.
+            self.int3_trap_in_progress = Some(Int3TrapInProgress {
+                addr: traced_function.virtual_addr,
+                instruction: traced_function.modified_instruction(),
+            });
+        }
+        Ok(())
     }
 }
 

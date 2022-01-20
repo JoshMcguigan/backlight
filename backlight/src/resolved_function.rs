@@ -18,14 +18,9 @@ impl ResolvedFunction {
     /// Returns the original instruction with the first byte replaced by int3
     /// to trigger a trap.
     pub fn modified_instruction(&self) -> i64 {
-        let original_instruction =
-            unsafe { mem::transmute::<i64, [u8; 8]>(self.original_instruction) };
-        // We want to be explicit here that we are taking a copy of the original
-        // instruction, rather than aliasing and then modifying the original.
-        #[allow(clippy::clone_on_copy)]
-        let mut m = original_instruction.clone();
-        m[0] = 0xcc;
+        let mut i = unsafe { mem::transmute::<i64, [u8; 8]>(self.original_instruction) };
+        i[0] = 0xcc;
 
-        unsafe { mem::transmute::<[u8; 8], i64>(m) }
+        unsafe { mem::transmute::<[u8; 8], i64>(i) }
     }
 }
