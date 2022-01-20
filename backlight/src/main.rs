@@ -63,6 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => (binary_to_trace, library_functions_to_trace),
     };
 
+    if library_functions_to_be_resolved.is_empty() {
+        library_functions_to_be_resolved = find_undefined_symbols(&binary_to_trace)?;
+    }
+
     let pid = spawn_tracee(&binary_to_trace)?;
 
     // The child reports being stopped by a SIGTRAP here.
@@ -74,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // At this point the shared libraries are not loaded. Watch for mmap
     // calls, indicating loading shared libraries.
-    while !library_functions_to_be_resolved.is_empty() {
+    loop {
         // Allow the tracee to advance to the next system call entrance or exit.
         ptrace::syscall(pid, None)?;
         wait!(pid);
@@ -121,6 +125,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let file_path = MMapPath::Path(file_path.clone());
                     // Check memory map for the new section.
+                    //
+                    // TODO get this info from the mmap call so we
+                    // don't have to wait for syscall exit.
                     if let Some(mapped_address_space) = procfs_process
                         .maps()
                         .expect("failed to read memory map")
@@ -135,68 +142,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && mapped_address_space.perms.contains('x')
                         })
                     {
-                        library_functions_to_trace.push(LibraryFunction {
+                        let virtual_addr =
+                            library_function_virtual_addr_offset + mapped_address_space.address.0;
+                        let library_function = LibraryFunction {
                             name: library_function_to_trace.into(),
-                            virtual_addr: library_function_virtual_addr_offset
-                                + mapped_address_space.address.0,
-                            original_instruction: 0,
-                        });
+                            virtual_addr,
+                            original_instruction: ptrace::read(pid, virtual_addr as *mut c_void)
+                                .unwrap(),
+                        };
+                        unsafe {
+                            ptrace::write(
+                                pid,
+                                library_function.virtual_addr as *mut c_void,
+                                library_function.modified_instruction() as *mut c_void,
+                            )
+                            .unwrap();
+                        }
+                        library_functions_to_trace.push(library_function);
                         false
                     } else {
                         true
                     }
                 })
                 .collect();
-        }
-    }
-
-    for library_function_info in library_functions_to_trace.iter_mut() {
-        let original_instruction =
-            ptrace::read(pid, library_function_info.virtual_addr as *mut c_void)?;
-        // Record the original instruction
-        library_function_info.original_instruction = original_instruction;
-
-        unsafe {
-            ptrace::write(
-                pid,
-                library_function_info.virtual_addr as *mut c_void,
-                library_function_info.modified_instruction() as *mut c_void,
-            )?;
-        }
-    }
-
-    loop {
-        ptrace::cont(pid, None)?;
-        wait!(pid);
-        // Check instruction pointer to see which (if any) of our
-        // functions we are stopped at.
-        let mut registers = ptrace::getregs(pid)?;
-        if let Some(traced_function) = library_functions_to_trace
-            .iter()
-            // When we stop, the instruction pointer will be on the instruction
-            // after our int3, so we subtrace one from the instruction pointer
-            // before doing the comparison.
-            .find(|f| f.virtual_addr == registers.rip - 1)
-        {
-            println!("called {}", &traced_function.name);
-            unsafe {
-                ptrace::write(
-                    pid,
-                    traced_function.virtual_addr as *mut c_void,
-                    traced_function.original_instruction as *mut c_void,
-                )?;
-            }
-            // need to move pc back by 1 here
-            registers.rip -= 1;
-            ptrace::setregs(pid, registers)?;
-            ptrace::step(pid, None)?;
-            wait!(pid);
-            unsafe {
-                ptrace::write(
-                    pid,
-                    traced_function.virtual_addr as *mut c_void,
-                    traced_function.modified_instruction() as *mut c_void,
-                )?;
+        } else {
+            // Rebind as mut, because the if-block above does not mutate the registers
+            // but this block does.
+            let mut registers = registers;
+            if let Some(traced_function) = library_functions_to_trace
+                .iter()
+                // When we stop, the instruction pointer will be on the instruction
+                // after our int3, so we subtrace one from the instruction pointer
+                // before doing the comparison.
+                .find(|f| f.virtual_addr == registers.rip - 1)
+            {
+                println!("called {}", &traced_function.name);
+                unsafe {
+                    ptrace::write(
+                        pid,
+                        traced_function.virtual_addr as *mut c_void,
+                        traced_function.original_instruction as *mut c_void,
+                    )?;
+                }
+                // need to move pc back by 1 here
+                registers.rip -= 1;
+                ptrace::setregs(pid, registers)?;
+                ptrace::step(pid, None)?;
+                wait!(pid);
+                unsafe {
+                    ptrace::write(
+                        pid,
+                        traced_function.virtual_addr as *mut c_void,
+                        traced_function.modified_instruction() as *mut c_void,
+                    )?;
+                }
             }
         }
     }
@@ -214,8 +213,8 @@ fn find_library_function_address_offset(
     path_to_library: &Path,
     library_function_to_trace: &str,
 ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
-    let libc_bytes = read(path_to_library)?;
-    let elf = Elf::parse(&libc_bytes)?;
+    let library_bytes = read(path_to_library)?;
+    let elf = Elf::parse(&library_bytes)?;
 
     let mut text_section_info = None;
     for (index, section_header) in elf.section_headers.into_iter().enumerate() {
@@ -261,11 +260,37 @@ fn find_library_function_address_offset(
     Ok(library_function_virtual_addr_offset)
 }
 
+/// This function returns all undefined symbols, representing functions, in the
+/// given elf. Undefined symbols in a binary will be dynamically linked.
+fn find_undefined_symbols(path_to_bin: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let library_bytes = read(path_to_bin)?;
+    let elf = Elf::parse(&library_bytes)?;
+    let mut out = vec![];
+    for symbol in elf
+        .dynsyms
+        .into_iter()
+        // The first entry is reserved and holds a default unitialized entry.
+        .skip(1)
+        .filter(|s| s.is_import())
+        .filter(|s| s.is_function())
+    {
+        let name = elf
+            .dynstrtab
+            .get_at(symbol.st_name)
+            .ok_or("failed to map symbol name")?;
+        out.push(name.into());
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
+    use std::{path::PathBuf, process::Command};
 
     use expect_test::{expect, Expect};
+
+    use crate::find_undefined_symbols;
 
     fn test_trace(bin_name: &str, trace_args: &[&str], expected: Expect) {
         cargo_build(bin_name);
@@ -341,6 +366,165 @@ mod tests {
                 std err:
 
             "#]],
+        );
+    }
+
+    #[test]
+    fn traces_all_library_calls() {
+        test_trace(
+            "test_support_abs",
+            &[],
+            expect![[r#"
+                status code: 0
+
+                std out:
+                called __libc_start_main
+                called poll
+                called signal
+                called sigaction
+                called sigaction
+                called sigaction
+                called sigaction
+                called sigaction
+                called sigaltstack
+                called sysconf
+                called mmap
+                called sysconf
+                called mprotect
+                called sysconf
+                called sigaltstack
+                called sysconf
+                called pthread_self
+                called pthread_getattr_np
+                called malloc
+                called malloc
+                called malloc
+                called fstat64
+                called malloc
+                called realloc
+                called realloc
+                called free
+                called free
+                called free
+                called realloc
+                called malloc
+                called calloc
+                called realloc
+                called malloc
+                called free
+                called pthread_attr_getstack
+                called pthread_attr_destroy
+                called free
+                called free
+                called malloc
+                called pthread_mutex_lock
+                called pthread_mutex_unlock
+                called malloc
+                called __cxa_thread_atexit_impl
+                called calloc
+                called abs
+                called labs
+                called abs
+                called labs
+                called abs
+                called sigaltstack
+                called sysconf
+                called sysconf
+                called munmap
+                called free
+                called free
+                called free
+                called __cxa_finalize
+                called __cxa_finalize
+                called __cxa_finalize
+                called __cxa_finalize
+                called __cxa_finalize
+                Child process exited
+
+                std err:
+
+            "#]],
+        );
+    }
+
+    #[test]
+    fn finds_undefined_symbols() {
+        cargo_build("test_support_abs");
+        expect![[r#"
+            mprotect
+            pthread_getspecific
+            _Unwind_GetRegionStart
+            memset
+            _Unwind_SetGR
+            posix_memalign
+            close
+            _Unwind_GetDataRelBase
+            abort
+            pthread_setspecific
+            memchr
+            malloc
+            __libc_start_main
+            pthread_getattr_np
+            _Unwind_DeleteException
+            sysconf
+            pthread_attr_destroy
+            _Unwind_GetLanguageSpecificData
+            free
+            strlen
+            stat64
+            __cxa_thread_atexit_impl
+            _Unwind_RaiseException
+            __cxa_finalize
+            realpath
+            pthread_key_delete
+            __tls_get_addr
+            syscall
+            _Unwind_GetIP
+            _Unwind_Backtrace
+            pthread_attr_getstack
+            pthread_self
+            poll
+            pthread_mutex_trylock
+            open64
+            sigaction
+            abs
+            fstat64
+            bcmp
+            readlink
+            signal
+            memmove
+            getenv
+            _Unwind_GetIPInfo
+            dl_iterate_phdr
+            __errno_location
+            getcwd
+            labs
+            pthread_rwlock_rdlock
+            calloc
+            munmap
+            __xpg_strerror_r
+            writev
+            dlsym
+            _Unwind_GetTextRelBase
+            pthread_rwlock_unlock
+            pthread_mutex_lock
+            realloc
+            pthread_key_create
+            pthread_mutex_destroy
+            write
+            _Unwind_Resume
+            sigaltstack
+            pthread_mutex_unlock
+            memcpy
+            open
+            mmap
+            _Unwind_SetIP
+        "#]]
+        .assert_eq(
+            &(find_undefined_symbols(&PathBuf::from("../target/debug/test_support_abs"))
+                .unwrap()
+                .join("\n")
+                + "\n"),
         );
     }
 }
