@@ -45,8 +45,20 @@ struct Tracee {
     procfs: procfs::process::Process,
     unresolved_functions: Vec<String>,
     resolved_functions: Vec<ResolvedFunction>,
+    /// If we've seen the entry to a mmap syscall but not the exit
+    /// we store the args here. Upon exit we resolve functions
+    /// and set this back to None.
+    mmap_in_progress: Option<MmapArgs>,
 }
 
+struct MmapArgs {
+    /// Path to the file being mmap'd.
+    file_path: PathBuf,
+    /// Offset into the file where the mapping starts.
+    offset: u64,
+}
+
+#[allow(clippy::large_enum_variant)]
 enum TraceeState {
     Alive(Tracee),
     Exited,
@@ -59,6 +71,8 @@ impl Tracee {
     ) -> Result<TraceeState> {
         let pid = spawn_tracee(binary_to_trace)?;
 
+        ptrace::setoptions(pid, ptrace::Options::PTRACE_O_TRACESYSGOOD)?;
+
         // The tracee should signal a SIGTRAP here.
         if matches!(waitpid(pid, None)?, WaitStatus::Exited(_, _)) {
             Ok(TraceeState::Exited)
@@ -68,49 +82,55 @@ impl Tracee {
                 procfs: Process::new(pid.as_raw())?,
                 unresolved_functions: library_functions_to_trace,
                 resolved_functions: vec![],
+                mmap_in_progress: None,
             }))
         }
     }
-    fn step(self) -> Result<TraceeState> {
-        // Allow the tracee to advance to the next system call entrance or exit.
-        //
-        // This will also stop for our INT3, or other signals.
+    fn step(mut self) -> Result<TraceeState> {
         ptrace::syscall(self.pid, None)?;
-        wait!(self.pid);
-
-        let registers = ptrace::getregs(self.pid)?;
-        if registers.rax == SYSCALL_ENTRY_MARKER
-            && registers.orig_rax == SYS_CALL_MMAP
-            && ProtFlags::from_bits_truncate(registers.rdx as i32).contains(ProtFlags::PROT_EXEC)
-        {
-            self.handle_mmap(registers)
-        } else {
-            self.handle_trap(registers)
+        match waitpid(self.pid, None)? {
+            WaitStatus::Exited(_, _) => Ok(TraceeState::Exited),
+            WaitStatus::PtraceSyscall(_pid) => {
+                let registers = ptrace::getregs(self.pid)?;
+                if registers.rax == SYSCALL_ENTRY_MARKER
+                    && registers.orig_rax == SYS_CALL_MMAP
+                    && ProtFlags::from_bits_truncate(registers.rdx as i32)
+                        .contains(ProtFlags::PROT_EXEC)
+                {
+                    self.handle_mmap_entrance(registers)?;
+                } else {
+                    // If we are stopped on a syscall and we have a mmap
+                    // in progress, we know we are exiting that mmap.
+                    if let Some(mmap_args) = self.mmap_in_progress.take() {
+                        self.handle_mmap_exit(mmap_args)?;
+                    } else {
+                        // handle any other sys call enter/exit
+                    }
+                }
+                Ok(TraceeState::Alive(self))
+            }
+            _ => {
+                let registers = ptrace::getregs(self.pid)?;
+                self.handle_trap(registers)
+            }
         }
     }
-    fn handle_mmap(mut self, registers: user_regs_struct) -> Result<TraceeState> {
+    fn handle_mmap_entrance(&mut self, registers: user_regs_struct) -> Result<()> {
         let file_descriptor = registers.r8;
-        // We could watch for openat syscalls to get this mapping for ourselves
-        // rather than looking at procfs, but for now this is easier.
         let file_path =
             if let Some(file_path) = get_file_path_from_fd(&self.procfs, file_descriptor)? {
                 file_path
             } else {
-                return Ok(TraceeState::Alive(self));
+                return Ok(());
             };
 
-        let mmap_offset = registers.r9;
+        let offset = registers.r9;
 
-        // Allow the tracee to advance to the system call exit.
-        //
-        // We know it is the exit at this point because our last
-        // wait was the entrance.
-        //
-        // TODO are there bugs here if there are other signals while this
-        // is happening?
-        ptrace::syscall(self.pid, None)?;
-        wait!(self.pid);
+        self.mmap_in_progress = Some(MmapArgs { file_path, offset });
 
+        Ok(())
+    }
+    fn handle_mmap_exit(&mut self, mmap_args: MmapArgs) -> Result<()> {
         let registers = ptrace::getregs(self.pid)?;
         let mapped_virtual_address_base = registers.rax;
 
@@ -120,12 +140,15 @@ impl Tracee {
             .filter(|library_function_to_trace| {
                 // If this file doesn't have our symbol we want to skip it.
                 let (library_function_base_file_offset, library_function_virtual_addr_offset) =
-                    match find_library_function_addr_info(&file_path, library_function_to_trace) {
+                    match find_library_function_addr_info(
+                        &mmap_args.file_path,
+                        library_function_to_trace,
+                    ) {
                         Ok(Some((a, b))) => (a, b),
                         _ => return true,
                     };
 
-                if library_function_base_file_offset == mmap_offset {
+                if library_function_base_file_offset == mmap_args.offset {
                     let virtual_addr =
                         library_function_virtual_addr_offset + mapped_virtual_address_base;
                     let library_function = ResolvedFunction {
@@ -150,7 +173,7 @@ impl Tracee {
             })
             .collect();
 
-        Ok(TraceeState::Alive(self))
+        Ok(())
     }
     fn handle_trap(self, mut registers: user_regs_struct) -> Result<TraceeState> {
         if let Some(traced_function) = self
