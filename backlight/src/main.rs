@@ -11,6 +11,7 @@ use clap::Parser;
 use goblin::elf::Elf;
 use nix::{
     errno::Errno,
+    libc::user_regs_struct,
     sys::{
         mman::ProtFlags,
         ptrace,
@@ -32,17 +33,163 @@ const SYS_CALL_MMAP: u64 = 9;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 macro_rules! wait {
-    ($pid:ident) => {
+    ($pid:expr) => {
         if matches!(waitpid($pid, None)?, WaitStatus::Exited(_, _)) {
-            println!("--- Child process exited ---");
-            return Ok(());
+            return Ok(TraceeState::Exited);
         }
     };
 }
 
+struct Tracee {
+    pid: Pid,
+    procfs: procfs::process::Process,
+    unresolved_functions: Vec<String>,
+    resolved_functions: Vec<ResolvedFunction>,
+}
+
+enum TraceeState {
+    Alive(Tracee),
+    Exited,
+}
+
+impl Tracee {
+    fn init(
+        binary_to_trace: &Path,
+        library_functions_to_trace: Vec<String>,
+    ) -> Result<TraceeState> {
+        let pid = spawn_tracee(binary_to_trace)?;
+
+        // The tracee should signal a SIGTRAP here.
+        if matches!(waitpid(pid, None)?, WaitStatus::Exited(_, _)) {
+            Ok(TraceeState::Exited)
+        } else {
+            Ok(TraceeState::Alive(Self {
+                pid,
+                procfs: Process::new(pid.as_raw())?,
+                unresolved_functions: library_functions_to_trace,
+                resolved_functions: vec![],
+            }))
+        }
+    }
+    fn step(self) -> Result<TraceeState> {
+        // Allow the tracee to advance to the next system call entrance or exit.
+        //
+        // This will also stop for our INT3, or other signals.
+        ptrace::syscall(self.pid, None)?;
+        wait!(self.pid);
+
+        let registers = ptrace::getregs(self.pid)?;
+        if registers.rax == SYSCALL_ENTRY_MARKER
+            && registers.orig_rax == SYS_CALL_MMAP
+            && ProtFlags::from_bits_truncate(registers.rdx as i32).contains(ProtFlags::PROT_EXEC)
+        {
+            self.handle_mmap(registers)
+        } else {
+            self.handle_trap(registers)
+        }
+    }
+    fn handle_mmap(mut self, registers: user_regs_struct) -> Result<TraceeState> {
+        let file_descriptor = registers.r8;
+        // We could watch for openat syscalls to get this mapping for ourselves
+        // rather than looking at procfs, but for now this is easier.
+        let file_path =
+            if let Some(file_path) = get_file_path_from_fd(&self.procfs, file_descriptor)? {
+                file_path
+            } else {
+                return Ok(TraceeState::Alive(self));
+            };
+
+        let mmap_offset = registers.r9;
+
+        // Allow the tracee to advance to the system call exit.
+        //
+        // We know it is the exit at this point because our last
+        // wait was the entrance.
+        //
+        // TODO are there bugs here if there are other signals while this
+        // is happening?
+        ptrace::syscall(self.pid, None)?;
+        wait!(self.pid);
+
+        let registers = ptrace::getregs(self.pid)?;
+        let mapped_virtual_address_base = registers.rax;
+
+        self.unresolved_functions = self
+            .unresolved_functions
+            .drain(..)
+            .filter(|library_function_to_trace| {
+                // If this file doesn't have our symbol we want to skip it.
+                let (library_function_base_file_offset, library_function_virtual_addr_offset) =
+                    match find_library_function_addr_info(&file_path, library_function_to_trace) {
+                        Ok(Some((a, b))) => (a, b),
+                        _ => return true,
+                    };
+
+                if library_function_base_file_offset == mmap_offset {
+                    let virtual_addr =
+                        library_function_virtual_addr_offset + mapped_virtual_address_base;
+                    let library_function = ResolvedFunction {
+                        name: library_function_to_trace.into(),
+                        virtual_addr,
+                        original_instruction: ptrace::read(self.pid, virtual_addr as *mut c_void)
+                            .unwrap(),
+                    };
+                    unsafe {
+                        ptrace::write(
+                            self.pid,
+                            library_function.virtual_addr as *mut c_void,
+                            library_function.modified_instruction() as *mut c_void,
+                        )
+                        .unwrap();
+                    }
+                    self.resolved_functions.push(library_function);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        Ok(TraceeState::Alive(self))
+    }
+    fn handle_trap(self, mut registers: user_regs_struct) -> Result<TraceeState> {
+        if let Some(traced_function) = self
+            .resolved_functions
+            .iter()
+            // When we stop, the instruction pointer will be on the instruction
+            // after our int3, so we subtract one from the instruction pointer
+            // before doing the comparison.
+            .find(|f| f.virtual_addr == registers.rip - 1)
+        {
+            println!("{}", &traced_function.name);
+            unsafe {
+                ptrace::write(
+                    self.pid,
+                    traced_function.virtual_addr as *mut c_void,
+                    traced_function.original_instruction as *mut c_void,
+                )?;
+            }
+            // need to move pc back by 1 here
+            registers.rip -= 1;
+            ptrace::setregs(self.pid, registers)?;
+            ptrace::step(self.pid, None)?;
+            wait!(self.pid);
+            unsafe {
+                ptrace::write(
+                    self.pid,
+                    traced_function.virtual_addr as *mut c_void,
+                    traced_function.modified_instruction() as *mut c_void,
+                )?;
+            }
+        }
+
+        Ok(TraceeState::Alive(self))
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let (binary_to_trace, mut unresolved_functions) = match args.command {
+    let (binary_to_trace, mut library_functions_to_trace) = match args.command {
         args::Command::Trace {
             binary_to_trace,
             library_functions_to_trace,
@@ -52,124 +199,24 @@ fn main() -> Result<()> {
 
     // If the user doesn't specify which functions they want to trace we
     // trace everything.
-    if unresolved_functions.is_empty() {
-        unresolved_functions = find_undefined_symbols(&binary_to_trace)?;
+    if library_functions_to_trace.is_empty() {
+        library_functions_to_trace = find_undefined_symbols(&binary_to_trace)?;
     }
 
-    let pid = spawn_tracee(&binary_to_trace)?;
+    let mut tracee = match Tracee::init(&binary_to_trace, library_functions_to_trace)? {
+        TraceeState::Alive(t) => t,
+        TraceeState::Exited => {
+            println!("--- Child process exited ---");
+            return Ok(());
+        }
+    };
 
-    // The child reports being stopped by a SIGTRAP here.
-    wait!(pid);
-
-    let procfs_process = Process::new(pid.as_raw())?;
-
-    let mut resolved_functions = vec![];
-
-    // At this point the shared libraries are not loaded. Watch for mmap
-    // calls, indicating loading shared libraries.
     loop {
-        // Allow the tracee to advance to the next system call entrance or exit.
-        //
-        // This will also stop for our INT3, or other signals.
-        ptrace::syscall(pid, None)?;
-        wait!(pid);
-
-        let registers = ptrace::getregs(pid)?;
-        if registers.rax == SYSCALL_ENTRY_MARKER
-            && registers.orig_rax == SYS_CALL_MMAP
-            && ProtFlags::from_bits_truncate(registers.rdx as i32).contains(ProtFlags::PROT_EXEC)
-        {
-            let file_descriptor = registers.r8;
-            // We could watch for openat syscalls to get this mapping for ourselves
-            // rather than looking at procfs, but for now this is easier.
-            let file_path =
-                if let Some(file_path) = get_file_path_from_fd(&procfs_process, file_descriptor)? {
-                    file_path
-                } else {
-                    continue;
-                };
-
-            let mmap_offset = registers.r9;
-
-            // Allow the tracee to advance to the system call exit.
-            //
-            // We know it is the exit at this point because our last
-            // wait was the entrance.
-            //
-            // TODO are there bugs here if there are other signals while this
-            // is happening?
-            ptrace::syscall(pid, None)?;
-            wait!(pid);
-
-            let registers = ptrace::getregs(pid)?;
-            let mapped_virtual_address_base = registers.rax;
-
-            unresolved_functions = unresolved_functions
-                .drain(..)
-                .filter(|library_function_to_trace| {
-                    // If this file doesn't have our symbol we want to skip it.
-                    let (library_function_base_file_offset, library_function_virtual_addr_offset) =
-                        match find_library_function_addr_info(&file_path, library_function_to_trace)
-                        {
-                            Ok(Some((a, b))) => (a, b),
-                            _ => return true,
-                        };
-
-                    if library_function_base_file_offset == mmap_offset {
-                        let virtual_addr =
-                            library_function_virtual_addr_offset + mapped_virtual_address_base;
-                        let library_function = ResolvedFunction {
-                            name: library_function_to_trace.into(),
-                            virtual_addr,
-                            original_instruction: ptrace::read(pid, virtual_addr as *mut c_void)
-                                .unwrap(),
-                        };
-                        unsafe {
-                            ptrace::write(
-                                pid,
-                                library_function.virtual_addr as *mut c_void,
-                                library_function.modified_instruction() as *mut c_void,
-                            )
-                            .unwrap();
-                        }
-                        resolved_functions.push(library_function);
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-        } else {
-            // Rebind as mut, because the if-block above does not mutate the registers
-            // but this block does.
-            let mut registers = registers;
-            if let Some(traced_function) = resolved_functions
-                .iter()
-                // When we stop, the instruction pointer will be on the instruction
-                // after our int3, so we subtract one from the instruction pointer
-                // before doing the comparison.
-                .find(|f| f.virtual_addr == registers.rip - 1)
-            {
-                println!("{}", &traced_function.name);
-                unsafe {
-                    ptrace::write(
-                        pid,
-                        traced_function.virtual_addr as *mut c_void,
-                        traced_function.original_instruction as *mut c_void,
-                    )?;
-                }
-                // need to move pc back by 1 here
-                registers.rip -= 1;
-                ptrace::setregs(pid, registers)?;
-                ptrace::step(pid, None)?;
-                wait!(pid);
-                unsafe {
-                    ptrace::write(
-                        pid,
-                        traced_function.virtual_addr as *mut c_void,
-                        traced_function.modified_instruction() as *mut c_void,
-                    )?;
-                }
+        tracee = match tracee.step()? {
+            TraceeState::Alive(t) => t,
+            TraceeState::Exited => {
+                println!("--- Child process exited ---");
+                return Ok(());
             }
         }
     }
