@@ -1,5 +1,3 @@
-use std::mem;
-
 #[derive(Debug)]
 /// Represents a function which has been mapped to a known location
 /// in virtual memory.
@@ -18,9 +16,9 @@ impl ResolvedFunction {
     /// Returns the original instruction with the first byte replaced by int3
     /// to trigger a trap.
     pub fn modified_instruction(&self) -> i64 {
-        let mut i = unsafe { mem::transmute::<i64, [u8; 8]>(self.original_instruction) };
+        let mut i = self.original_instruction.to_ne_bytes();
         i[0] = 0xcc;
 
-        unsafe { mem::transmute::<[u8; 8], i64>(i) }
+        i64::from_ne_bytes(i)
     }
 }
