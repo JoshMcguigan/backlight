@@ -1,10 +1,43 @@
 # Backlight
 
-Backlight is a tool for tracing calls to shared libraries. It is similar to `ltrace` except it works by using software breakpoints rather than hijacking the procedure linkage table, so it works on binaries compiled with [full RELRO](https://www.redhat.com/en/blog/hardening-elf-binaries-using-relocation-read-only-relro) (i.e. [all binaries produced by rustc](https://doc.rust-lang.org/beta/rustc/exploit-mitigations.html#read-only-relocations-and-immediate-binding)).
+Backlight is a dynamic binary tracing tool. It is similar to `ltrace` except it works by using software breakpoints rather than hijacking the procedure linkage table, so it works on binaries compiled with [full RELRO](https://www.redhat.com/en/blog/hardening-elf-binaries-using-relocation-read-only-relro) (i.e. [all binaries produced by rustc](https://doc.rust-lang.org/beta/rustc/exploit-mitigations.html#read-only-relocations-and-immediate-binding)).
+
+## Install
+
+```sh
+$ git clone git@github.com:JoshMcguigan/backlight.git
+
+$ cd backlight
+
+$ cargo install-backlight
+```
 
 ## Usage
 
-TODO provide usage examples once CLI is implemented
+```sh
+# Trace all system calls, shared library function calls, etc
+$ backlight trace /bin/ls
+...
+[lib] malloc
+[sys] sys_brk
+[sys] sys_brk
+[lib] free
+[sys] sys_openat
+[sys] sys_newfstatat
+[sys] sys_mmap
+[sys] sys_close
+[lib] malloc
+...
+--- Child process exited ---
+
+# Trace specific system calls
+$ backlight trace /bin/ls -s sys_openat -s sys_close
+
+# Trace specific shared library function calls
+$ backlight trace /bin/ls -l malloc -l free
+```
+
+I'm looking for feedback on the UX of backlight. Stop by [#3](https://github.com/JoshMcguigan/backlight/issues/3) and share your opinions!
 
 ## License
 
