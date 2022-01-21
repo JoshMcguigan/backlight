@@ -322,6 +322,9 @@ dependencies = [
 [[package]]
 name = "test_support"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "textwrap"
