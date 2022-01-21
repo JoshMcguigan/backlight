@@ -114,24 +114,8 @@ impl Tracee {
             WaitStatus::Exited(_, _) => Ok(TraceeState::Exited),
             WaitStatus::PtraceSyscall(_pid) => {
                 let registers = ptrace::getregs(self.pid)?;
-                if registers.rax == SYSCALL_ENTRY_MARKER {
-                    let name = syscall_name(registers.orig_rax)
-                        .map(|s| s.to_string())
-                        .unwrap_or(format!("SYS_UNKNOWN_{}", registers.orig_rax));
+                self.possibly_trace_syscall(&registers)?;
 
-                    let should_trace = match &self.syscalls_to_trace {
-                        SyscallsToTrace::All => true,
-                        SyscallsToTrace::These(syscalls_to_trace)
-                            if syscalls_to_trace.contains(&name) =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    };
-                    if should_trace {
-                        println!("[sys] {}", name);
-                    }
-                }
                 if registers.rax == SYSCALL_ENTRY_MARKER
                     && registers.orig_rax == SYS_CALL_MMAP
                     && ProtFlags::from_bits_truncate(registers.rdx as i32)
@@ -260,6 +244,26 @@ impl Tracee {
                 addr: traced_function.virtual_addr,
                 instruction: traced_function.modified_instruction(),
             });
+        }
+        Ok(())
+    }
+
+    fn possibly_trace_syscall(&self, registers: &user_regs_struct) -> Result<()> {
+        if registers.rax == SYSCALL_ENTRY_MARKER {
+            let name = syscall_name(registers.orig_rax)
+                .map(|s| s.to_string())
+                .unwrap_or(format!("SYS_UNKNOWN_{}", registers.orig_rax));
+
+            let should_trace = match &self.syscalls_to_trace {
+                SyscallsToTrace::All => true,
+                SyscallsToTrace::These(syscalls_to_trace) if syscalls_to_trace.contains(&name) => {
+                    true
+                }
+                _ => false,
+            };
+            if should_trace {
+                println!("[sys] {}", name);
+            }
         }
         Ok(())
     }
