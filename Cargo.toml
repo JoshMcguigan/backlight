@@ -4,17 +4,3 @@ members = [
 	"backlight",
 	"test_support",
 ]
-
-[profile.dev]
-# This is really only needed for the no_std test_support binaries, but cargo
-# doesn't support setting panic on a per package basis.
-#
-# https://github.com/rust-lang/cargo/issues/8264#issuecomment-751931213
-panic = "abort"
-
-[profile.release]
-# See note in the dev profile for the reason we override this for dev builds. The
-# expectation is the test_support binaries will only be built with the dev profile,
-# so we keep panic set to unwind in release builds for the benefit of actual users
-# of the backlight binary.
-panic = "unwind"

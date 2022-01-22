@@ -426,11 +426,9 @@ fn get_file_path_from_fd(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, process::Command};
+    use std::process::Command;
 
     use expect_test::{expect, Expect};
-
-    use crate::find_undefined_symbols;
 
     /// Used to assert on the exact output of backlight.
     fn test_trace(bin_name: &str, trace_args: &[&str], expected: Expect) {
@@ -554,20 +552,10 @@ mod tests {
 
     #[test]
     fn traces_multiple_syscalls() {
-        test_trace(
+        assert_trace_contains(
             "test_support_abs",
             &["-s", "sys_brk", "-s", "sys_exit_group"],
-            expect![[r#"
-                status code: 0
-
-                std out:
-                [sys] sys_brk
-                [sys] sys_exit_group
-                --- Child process exited ---
-
-                std err:
-
-            "#]],
+            &["[sys] sys_brk", "[sys] sys_exit_group"],
         );
     }
 
@@ -600,23 +588,5 @@ mod tests {
         // we just confirm we see some indication that each expected thing shows
         // up somewhere in the backlight output.
         assert_trace_contains("test_support_abs", &[], &["[sys]", "[lib]"]);
-    }
-
-    #[test]
-    fn finds_undefined_symbols() {
-        cargo_build("test_support_abs");
-        expect![[r#"
-            abs
-            labs
-            __libc_start_main
-            exit
-            __cxa_finalize
-        "#]]
-        .assert_eq(
-            &(find_undefined_symbols(&PathBuf::from("../target/debug/test_support_abs"))
-                .unwrap()
-                .join("\n")
-                + "\n"),
-        );
     }
 }
