@@ -432,6 +432,7 @@ mod tests {
 
     use crate::find_undefined_symbols;
 
+    /// Used to assert on the exact output of backlight.
     fn test_trace(bin_name: &str, trace_args: &[&str], expected: Expect) {
         cargo_build("backlight");
         cargo_build(bin_name);
@@ -453,6 +454,29 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         expected.assert_eq(&result);
+    }
+
+    /// Used to assert that the output of backlight contains some values. Useful
+    /// to create tests which don't depend on the specifics of the environment
+    /// they run in.
+    fn assert_trace_contains(bin_name: &str, trace_args: &[&str], expected: &[&str]) {
+        cargo_build("backlight");
+        cargo_build(bin_name);
+
+        let output = Command::new("../target/debug/backlight")
+            .arg("trace")
+            .arg(&format!("../target/debug/{}", bin_name))
+            .args(trace_args)
+            .output()
+            .unwrap();
+
+        assert_eq!(0, output.status.code().unwrap());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        for expected_str in expected {
+            assert!(stdout.contains(expected_str));
+        }
     }
 
     fn cargo_build(bin_name: &str) {
@@ -570,135 +594,12 @@ mod tests {
 
     #[test]
     fn traces_all_by_default() {
-        test_trace(
-            "test_support_abs",
-            &[],
-            expect![[r#"
-                status code: 0
-
-                std out:
-                [sys] sys_brk
-                [sys] sys_arch_prctl
-                [sys] sys_mmap
-                [sys] sys_access
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_openat
-                [sys] sys_read
-                [sys] sys_pread64
-                [sys] sys_pread64
-                [sys] sys_pread64
-                [sys] sys_newfstatat
-                [sys] sys_pread64
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_mmap
-                [sys] sys_arch_prctl
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_munmap
-                [lib] __libc_start_main
-                [lib] abs
-                [lib] labs
-                [lib] abs
-                [lib] labs
-                [lib] abs
-                [lib] exit
-                [lib] __cxa_finalize
-                [sys] sys_exit_group
-                --- Child process exited ---
-
-                std err:
-
-            "#]],
-        );
+        // The expected behavior of backlight when not provided with any explicit
+        // filters is to trace everything. The exact output of the trace will be
+        // platform specific, so rather than asserting on the exact output
+        // we just confirm we see some indication that each expected thing shows
+        // up somewhere in the backlight output.
+        assert_trace_contains("test_support_abs", &[], &["[sys]", "[lib]"]);
     }
 
     #[test]
