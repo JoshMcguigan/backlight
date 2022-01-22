@@ -1,3 +1,5 @@
+//! This binary is built to act as a test tracing target for backlight.
+
 use std::os::raw::{c_int, c_long};
 
 #[link(name = "c")]

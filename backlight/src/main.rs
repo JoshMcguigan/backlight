@@ -426,12 +426,11 @@ fn get_file_path_from_fd(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, process::Command};
+    use std::process::Command;
 
     use expect_test::{expect, Expect};
 
-    use crate::find_undefined_symbols;
-
+    /// Used to assert on the exact output of backlight.
     fn test_trace(bin_name: &str, trace_args: &[&str], expected: Expect) {
         cargo_build("backlight");
         cargo_build(bin_name);
@@ -453,6 +452,29 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         expected.assert_eq(&result);
+    }
+
+    /// Used to assert that the output of backlight contains some values. Useful
+    /// to create tests which don't depend on the specifics of the environment
+    /// they run in.
+    fn assert_trace_contains(bin_name: &str, trace_args: &[&str], expected: &[&str]) {
+        cargo_build("backlight");
+        cargo_build(bin_name);
+
+        let output = Command::new("../target/debug/backlight")
+            .arg("trace")
+            .arg(&format!("../target/debug/{}", bin_name))
+            .args(trace_args)
+            .output()
+            .unwrap();
+
+        assert_eq!(0, output.status.code().unwrap());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        for expected_str in expected {
+            assert!(stdout.contains(expected_str));
+        }
     }
 
     fn cargo_build(bin_name: &str) {
@@ -514,14 +536,12 @@ mod tests {
     fn traces_single_syscall() {
         test_trace(
             "test_support_abs",
-            &["-s", "sys_brk"],
+            &["-s", "sys_exit_group"],
             expect![[r#"
                 status code: 0
 
                 std out:
-                [sys] sys_brk
-                [sys] sys_brk
-                [sys] sys_brk
+                [sys] sys_exit_group
                 --- Child process exited ---
 
                 std err:
@@ -532,22 +552,10 @@ mod tests {
 
     #[test]
     fn traces_multiple_syscalls() {
-        test_trace(
+        assert_trace_contains(
             "test_support_abs",
             &["-s", "sys_brk", "-s", "sys_exit_group"],
-            expect![[r#"
-                status code: 0
-
-                std out:
-                [sys] sys_brk
-                [sys] sys_brk
-                [sys] sys_brk
-                [sys] sys_exit_group
-                --- Child process exited ---
-
-                std err:
-
-            "#]],
+            &["[sys] sys_brk", "[sys] sys_exit_group"],
         );
     }
 
@@ -555,17 +563,15 @@ mod tests {
     fn traces_syscall_and_library_function() {
         test_trace(
             "test_support_abs",
-            &["-s", "sys_brk", "-l", "abs"],
+            &["-s", "sys_exit_group", "-l", "abs"],
             expect![[r#"
                 status code: 0
 
                 std out:
-                [sys] sys_brk
-                [sys] sys_brk
-                [sys] sys_brk
                 [lib] abs
                 [lib] abs
                 [lib] abs
+                [sys] sys_exit_group
                 --- Child process exited ---
 
                 std err:
@@ -576,357 +582,11 @@ mod tests {
 
     #[test]
     fn traces_all_by_default() {
-        test_trace(
-            "test_support_abs",
-            &[],
-            expect![[r#"
-                status code: 0
-
-                std out:
-                [sys] sys_brk
-                [sys] sys_arch_prctl
-                [sys] sys_mmap
-                [sys] sys_access
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_openat
-                [sys] sys_newfstatat
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_openat
-                [sys] sys_read
-                [sys] sys_pread64
-                [sys] sys_pread64
-                [sys] sys_pread64
-                [sys] sys_newfstatat
-                [sys] sys_pread64
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_read
-                [sys] sys_newfstatat
-                [sys] sys_mmap
-                [sys] sys_mprotect
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_read
-                [sys] sys_pread64
-                [sys] sys_pread64
-                [sys] sys_newfstatat
-                [sys] sys_mmap
-                [sys] sys_mprotect
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_read
-                [sys] sys_newfstatat
-                [sys] sys_mmap
-                [sys] sys_mprotect
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_openat
-                [sys] sys_read
-                [sys] sys_newfstatat
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_close
-                [sys] sys_mmap
-                [sys] sys_mmap
-                [sys] sys_arch_prctl
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_mprotect
-                [sys] sys_munmap
-                [sys] sys_set_tid_address
-                [sys] sys_set_robust_list
-                [sys] sys_rt_sigaction
-                [sys] sys_rt_sigaction
-                [sys] sys_rt_sigprocmask
-                [sys] sys_prlimit64
-                [lib] __libc_start_main
-                [lib] poll
-                [sys] sys_poll
-                [lib] signal
-                [lib] sigaction
-                [sys] sys_rt_sigaction
-                [lib] sigaction
-                [sys] sys_rt_sigaction
-                [lib] sigaction
-                [sys] sys_rt_sigaction
-                [lib] sigaction
-                [sys] sys_rt_sigaction
-                [lib] sigaction
-                [sys] sys_rt_sigaction
-                [lib] sigaltstack
-                [sys] sys_sigaltstack
-                [lib] sysconf
-                [lib] mmap
-                [sys] sys_mmap
-                [lib] sysconf
-                [lib] mprotect
-                [sys] sys_mprotect
-                [lib] sysconf
-                [lib] sigaltstack
-                [sys] sys_sigaltstack
-                [lib] sysconf
-                [lib] pthread_self
-                [lib] pthread_getattr_np
-                [lib] malloc
-                [lib] malloc
-                [sys] sys_brk
-                [sys] sys_brk
-                [sys] sys_openat
-                [sys] sys_prlimit64
-                [lib] malloc
-                [lib] fstat64
-                [sys] sys_newfstatat
-                [lib] malloc
-                [sys] sys_read
-                [lib] realloc
-                [lib] realloc
-                [sys] sys_read
-                [sys] sys_read
-                [sys] sys_read
-                [sys] sys_read
-                [lib] free
-                [sys] sys_close
-                [lib] free
-                [lib] free
-                [lib] realloc
-                [lib] malloc
-                [sys] sys_sched_getaffinity
-                [lib] calloc
-                [lib] realloc
-                [lib] malloc
-                [lib] free
-                [lib] pthread_attr_getstack
-                [lib] pthread_attr_destroy
-                [lib] free
-                [lib] free
-                [lib] malloc
-                [lib] pthread_mutex_lock
-                [lib] pthread_mutex_unlock
-                [lib] malloc
-                [lib] __cxa_thread_atexit_impl
-                [lib] calloc
-                [lib] abs
-                [lib] labs
-                [lib] abs
-                [lib] labs
-                [lib] abs
-                [lib] sigaltstack
-                [sys] sys_sigaltstack
-                [lib] sysconf
-                [lib] sysconf
-                [lib] munmap
-                [sys] sys_munmap
-                [lib] free
-                [lib] free
-                [lib] free
-                [lib] __cxa_finalize
-                [lib] __cxa_finalize
-                [lib] __cxa_finalize
-                [lib] __cxa_finalize
-                [lib] __cxa_finalize
-                [sys] sys_exit_group
-                --- Child process exited ---
-
-                std err:
-
-            "#]],
-        );
-    }
-
-    #[test]
-    fn finds_undefined_symbols() {
-        cargo_build("test_support_abs");
-        expect![[r#"
-            mprotect
-            pthread_getspecific
-            _Unwind_GetRegionStart
-            memset
-            _Unwind_SetGR
-            posix_memalign
-            close
-            _Unwind_GetDataRelBase
-            abort
-            pthread_setspecific
-            memchr
-            malloc
-            __libc_start_main
-            pthread_getattr_np
-            _Unwind_DeleteException
-            sysconf
-            pthread_attr_destroy
-            _Unwind_GetLanguageSpecificData
-            free
-            strlen
-            stat64
-            __cxa_thread_atexit_impl
-            _Unwind_RaiseException
-            __cxa_finalize
-            realpath
-            pthread_key_delete
-            __tls_get_addr
-            syscall
-            _Unwind_GetIP
-            _Unwind_Backtrace
-            pthread_attr_getstack
-            pthread_self
-            poll
-            pthread_mutex_trylock
-            open64
-            sigaction
-            abs
-            fstat64
-            bcmp
-            readlink
-            signal
-            memmove
-            getenv
-            _Unwind_GetIPInfo
-            dl_iterate_phdr
-            __errno_location
-            getcwd
-            labs
-            pthread_rwlock_rdlock
-            calloc
-            munmap
-            __xpg_strerror_r
-            writev
-            dlsym
-            _Unwind_GetTextRelBase
-            pthread_rwlock_unlock
-            pthread_mutex_lock
-            realloc
-            pthread_key_create
-            pthread_mutex_destroy
-            write
-            _Unwind_Resume
-            sigaltstack
-            pthread_mutex_unlock
-            memcpy
-            open
-            mmap
-            _Unwind_SetIP
-        "#]]
-        .assert_eq(
-            &(find_undefined_symbols(&PathBuf::from("../target/debug/test_support_abs"))
-                .unwrap()
-                .join("\n")
-                + "\n"),
-        );
+        // The expected behavior of backlight when not provided with any explicit
+        // filters is to trace everything. The exact output of the trace will be
+        // platform specific, so rather than asserting on the exact output
+        // we just confirm we see some indication that each expected thing shows
+        // up somewhere in the backlight output.
+        assert_trace_contains("test_support_abs", &[], &["[sys]", "[lib]"]);
     }
 }
