@@ -270,19 +270,11 @@ impl Tracee {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    let (binary_to_trace, library_functions_to_trace, syscalls_to_trace) = match args.command {
-        args::Command::Trace {
-            binary_to_trace,
-            library_functions_to_trace,
-            syscalls_to_trace,
-            ..
-        } => (
-            binary_to_trace,
-            library_functions_to_trace,
-            syscalls_to_trace,
-        ),
-    };
+    let Args {
+        binary_to_trace,
+        library_functions_to_trace,
+        syscalls_to_trace,
+    } = Args::parse();
 
     // If the user doesn't specify what they want to trace we trace everything.
     let (library_functions_to_trace, syscalls_to_trace) =
@@ -436,7 +428,6 @@ mod tests {
         cargo_build(bin_name);
 
         let output = Command::new("../target/debug/backlight")
-            .arg("trace")
             .arg(&format!("../target/debug/{}", bin_name))
             .args(trace_args)
             .output()
@@ -462,7 +453,6 @@ mod tests {
         cargo_build(bin_name);
 
         let output = Command::new("../target/debug/backlight")
-            .arg("trace")
             .arg(&format!("../target/debug/{}", bin_name))
             .args(trace_args)
             .output()

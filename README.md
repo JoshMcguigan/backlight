@@ -16,7 +16,7 @@ $ cargo install-backlight
 
 ```sh
 # Trace all system calls, shared library function calls, etc
-$ backlight trace /bin/ls
+$ backlight /bin/ls
 ...
 [lib] malloc
 [sys] sys_brk
@@ -31,10 +31,10 @@ $ backlight trace /bin/ls
 --- Child process exited ---
 
 # Trace specific system calls
-$ backlight trace /bin/ls -s sys_openat -s sys_close
+$ backlight /bin/ls -s sys_openat -s sys_close
 
 # Trace specific shared library function calls
-$ backlight trace /bin/ls -l malloc -l free
+$ backlight /bin/ls -l malloc -l free
 ```
 
 I'm looking for feedback on the UX of backlight. Stop by [#3](https://github.com/JoshMcguigan/backlight/issues/3) and share your opinions!

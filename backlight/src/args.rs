@@ -2,17 +2,9 @@ use std::path::PathBuf;
 
 #[derive(clap::Parser)]
 pub struct Args {
-    #[clap(subcommand)]
-    pub command: Command,
-}
-
-#[derive(clap::Subcommand)]
-pub enum Command {
-    Trace {
-        binary_to_trace: PathBuf,
-        #[clap(short = 'l')]
-        library_functions_to_trace: Vec<String>,
-        #[clap(short = 's')]
-        syscalls_to_trace: Vec<String>,
-    },
+    pub binary_to_trace: PathBuf,
+    #[clap(short = 'l')]
+    pub library_functions_to_trace: Vec<String>,
+    #[clap(short = 's')]
+    pub syscalls_to_trace: Vec<String>,
 }
