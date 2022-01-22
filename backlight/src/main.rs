@@ -63,7 +63,7 @@ struct Int3TrapInProgress {
 #[allow(clippy::large_enum_variant)]
 enum TraceeState {
     Alive(Tracee),
-    Exited,
+    Exited(i32),
 }
 
 enum SyscallsToTrace {
@@ -77,19 +77,19 @@ enum SyscallsToTrace {
 impl Tracee {
     fn init(
         binary_to_trace: &Path,
+        tracee_args: &[String],
         library_functions_to_trace: Vec<String>,
         syscalls_to_trace: SyscallsToTrace,
     ) -> Result<TraceeState> {
-        let pid = spawn_tracee(binary_to_trace)?;
+        let pid = spawn_tracee(binary_to_trace, tracee_args)?;
 
         // This allows distinguishing traps for sys calls from other traps.
         ptrace::setoptions(pid, ptrace::Options::PTRACE_O_TRACESYSGOOD)?;
 
         // The tracee should signal a SIGTRAP here.
-        if matches!(waitpid(pid, None)?, WaitStatus::Exited(_, _)) {
-            Ok(TraceeState::Exited)
-        } else {
-            Ok(TraceeState::Alive(Self {
+        match waitpid(pid, None)? {
+            WaitStatus::Exited(_, code) => Ok(TraceeState::Exited(code)),
+            _ => Ok(TraceeState::Alive(Self {
                 pid,
                 procfs: Process::new(pid.as_raw())?,
                 unresolved_functions: library_functions_to_trace,
@@ -97,7 +97,7 @@ impl Tracee {
                 syscalls_to_trace,
                 mmap_in_progress: None,
                 int3_trap_in_progress: None,
-            }))
+            })),
         }
     }
     fn step(mut self) -> Result<TraceeState> {
@@ -111,7 +111,7 @@ impl Tracee {
             ptrace::syscall(self.pid, None)?;
         }
         match waitpid(self.pid, None)? {
-            WaitStatus::Exited(_, _) => Ok(TraceeState::Exited),
+            WaitStatus::Exited(_, code) => Ok(TraceeState::Exited(code)),
             WaitStatus::PtraceSyscall(_pid) => {
                 let registers = ptrace::getregs(self.pid)?;
                 self.possibly_trace_syscall(&registers)?;
@@ -274,6 +274,7 @@ fn main() -> Result<()> {
         binary_to_trace,
         library_functions_to_trace,
         syscalls_to_trace,
+        tracee_args,
     } = Args::parse();
 
     // If the user doesn't specify what they want to trace we trace everything.
@@ -292,12 +293,13 @@ fn main() -> Result<()> {
 
     let mut tracee = match Tracee::init(
         &binary_to_trace,
+        &tracee_args,
         library_functions_to_trace,
         syscalls_to_trace,
     )? {
         TraceeState::Alive(t) => t,
-        TraceeState::Exited => {
-            println!("--- Child process exited ---");
+        TraceeState::Exited(code) => {
+            print_child_process_exited_message(code);
             return Ok(());
         }
     };
@@ -305,16 +307,21 @@ fn main() -> Result<()> {
     loop {
         tracee = match tracee.step()? {
             TraceeState::Alive(t) => t,
-            TraceeState::Exited => {
-                println!("--- Child process exited ---");
+            TraceeState::Exited(code) => {
+                print_child_process_exited_message(code);
                 return Ok(());
             }
         }
     }
 }
 
-fn spawn_tracee(binary_to_trace: &Path) -> Result<Pid> {
+fn print_child_process_exited_message(code: i32) {
+    println!("--- Child process exited with status code {} ---", code);
+}
+
+fn spawn_tracee(binary_to_trace: &Path, tracee_args: &[String]) -> Result<Pid> {
     let mut c = Command::new(&binary_to_trace);
+    c.args(tracee_args);
     unsafe {
         c.pre_exec(|| ptrace::traceme().map_err(|err| io::Error::from_raw_os_error(err as i32)));
     }
@@ -492,7 +499,7 @@ mod tests {
                 [lib] abs
                 [lib] abs
                 [lib] abs
-                --- Child process exited ---
+                --- Child process exited with status code 0 ---
 
                 std err:
 
@@ -514,7 +521,7 @@ mod tests {
                 [lib] abs
                 [lib] labs
                 [lib] abs
-                --- Child process exited ---
+                --- Child process exited with status code 0 ---
 
                 std err:
 
@@ -532,7 +539,7 @@ mod tests {
 
                 std out:
                 [sys] sys_exit_group
-                --- Child process exited ---
+                --- Child process exited with status code 0 ---
 
                 std err:
 
@@ -562,7 +569,7 @@ mod tests {
                 [lib] abs
                 [lib] abs
                 [sys] sys_exit_group
-                --- Child process exited ---
+                --- Child process exited with status code 0 ---
 
                 std err:
 
@@ -578,5 +585,20 @@ mod tests {
         // we just confirm we see some indication that each expected thing shows
         // up somewhere in the backlight output.
         assert_trace_contains("test_support_abs", &[], &["[sys]", "[lib]"]);
+    }
+
+    #[test]
+    fn passes_along_args() {
+        // This binary exits with the code given as its first arg.
+        //
+        // This test demonstrates that backlight will pass along args to
+        // the tracee.
+        for code in &["0", "47"] {
+            assert_trace_contains(
+                "test_support_exit",
+                &["--", code],
+                &[&format!("Child process exited with status code {}", code)],
+            );
+        }
     }
 }

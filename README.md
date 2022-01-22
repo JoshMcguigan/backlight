@@ -31,10 +31,13 @@ $ backlight /bin/ls
 --- Child process exited ---
 
 # Trace specific system calls
-$ backlight /bin/ls -s sys_openat -s sys_close
+$ backlight -s sys_openat -s sys_close /bin/ls 
 
 # Trace specific shared library function calls
-$ backlight /bin/ls -l malloc -l free
+$ backlight -l malloc -l free /bin/ls
+
+# Add args after `--` and backlight will pass them along to the tracee
+$ backlight /bin/ls -- -a
 ```
 
 I'm looking for feedback on the UX of backlight. Stop by [#3](https://github.com/JoshMcguigan/backlight/issues/3) and share your opinions!
