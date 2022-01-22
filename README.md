@@ -1,6 +1,6 @@
 # Backlight
 
-Backlight is a dynamic binary tracing tool. It is similar to `ltrace` except it works by using software breakpoints rather than hijacking the procedure linkage table, so it works on binaries compiled with [full RELRO](https://www.redhat.com/en/blog/hardening-elf-binaries-using-relocation-read-only-relro) (i.e. [all binaries produced by rustc](https://doc.rust-lang.org/beta/rustc/exploit-mitigations.html#read-only-relocations-and-immediate-binding)).
+Backlight is a dynamic binary tracing tool.
 
 ## Install
 
