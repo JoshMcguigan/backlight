@@ -3,8 +3,7 @@
 fn main() {
     let code = std::env::args()
         .into_iter()
-        .skip(1)
-        .next()
+        .nth(1)
         .map(|arg_string| arg_string.parse().ok())
         .flatten()
         .unwrap_or(0);
