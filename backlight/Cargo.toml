@@ -4,10 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+backlight_lib = { path = "../backlight_lib" }
 clap = { version = "3", features = ["derive"] }
-goblin = "0.4"
-nix = "0.23"
-procfs = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 expect-test = "1"

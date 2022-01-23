@@ -1,0 +1,9 @@
+[package]
+name = "backlight_lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+goblin = "0.4"
+nix = "0.23"
+procfs = { version = "0.12", default-features = false }

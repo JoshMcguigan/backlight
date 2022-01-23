@@ -2,5 +2,6 @@
 
 members = [
 	"backlight",
+	"backlight_lib",
 	"test_support",
 ]
