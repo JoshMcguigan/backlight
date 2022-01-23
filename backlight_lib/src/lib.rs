@@ -37,7 +37,6 @@ pub struct Tracee {
     procfs: procfs::process::Process,
     unresolved_functions: Vec<String>,
     resolved_functions: Vec<ResolvedFunction>,
-    syscalls_to_trace: SyscallsToTrace,
     /// If we've seen the entry to a mmap syscall but not the exit
     /// we store the args here. Upon exit we resolve functions
     /// and set this back to None.
@@ -60,24 +59,22 @@ struct Int3TrapInProgress {
 #[allow(clippy::large_enum_variant)]
 pub enum TraceeState {
     Alive(Tracee),
+    StoppedAtSystemCallEntrance(Tracee, SysCall),
+    StoppedAtSystemCallExit(Tracee),
+    StoppedAtFunctionEntrace(Tracee, Func),
     Exited(i32),
 }
 
-pub enum SyscallsToTrace {
-    All,
-    /// Names of the syscalls the user would like to trace.
-    ///
-    /// This can be empty, in which case we will not trace any syscalls.
-    These(Vec<String>),
-}
+/// TODO replace this with enumeration of all syscalls, with args mapped
+pub type SysCall = String;
+pub type Func = String;
 
 impl Tracee {
     pub fn init(
         binary_to_trace: &Path,
         tracee_args: &[String],
         library_functions_to_trace: Vec<String>,
-        syscalls_to_trace: SyscallsToTrace,
-    ) -> Result<TraceeState> {
+    ) -> Result<Self> {
         let pid = spawn_tracee(binary_to_trace, tracee_args)?;
 
         // This allows distinguishing traps for sys calls from other traps.
@@ -85,16 +82,17 @@ impl Tracee {
 
         // The tracee should signal a SIGTRAP here.
         match waitpid(pid, None)? {
-            WaitStatus::Exited(_, code) => Ok(TraceeState::Exited(code)),
-            _ => Ok(TraceeState::Alive(Self {
+            WaitStatus::Exited(_, code) => {
+                Err(format!("Child process exited with status code {}", code).into())
+            }
+            _ => Ok(Self {
                 pid,
                 procfs: Process::new(pid.as_raw())?,
                 unresolved_functions: library_functions_to_trace,
                 resolved_functions: vec![],
-                syscalls_to_trace,
                 mmap_in_progress: None,
                 int3_trap_in_progress: None,
-            })),
+            }),
         }
     }
     pub fn step(mut self) -> Result<TraceeState> {
@@ -111,7 +109,6 @@ impl Tracee {
             WaitStatus::Exited(_, code) => Ok(TraceeState::Exited(code)),
             WaitStatus::PtraceSyscall(_pid) => {
                 let registers = ptrace::getregs(self.pid)?;
-                self.possibly_trace_syscall(&registers)?;
 
                 if registers.rax == SYSCALL_ENTRY_MARKER
                     && registers.orig_rax == SYS_CALL_MMAP
@@ -124,11 +121,30 @@ impl Tracee {
                     // in progress, we know we are exiting that mmap.
                     if let Some(mmap_args) = self.mmap_in_progress.take() {
                         self.handle_mmap_exit(mmap_args)?;
-                    } else {
-                        // handle any other sys call enter/exit
                     }
                 }
-                Ok(TraceeState::Alive(self))
+
+                if registers.rax == SYSCALL_ENTRY_MARKER {
+                    if registers.orig_rax == SYS_CALL_MMAP
+                        && ProtFlags::from_bits_truncate(registers.rdx as i32)
+                            .contains(ProtFlags::PROT_EXEC)
+                    {
+                        self.handle_mmap_entrance(registers)?;
+                    }
+
+                    let name = syscall_name(registers.orig_rax)
+                        .map(|s| s.to_string())
+                        .unwrap_or(format!("SYS_UNKNOWN_{}", registers.orig_rax));
+                    Ok(TraceeState::StoppedAtSystemCallEntrance(self, name))
+                } else {
+                    // If we are stopped on a syscall exit and we have a mmap
+                    // in progress, we know we are exiting that mmap.
+                    if let Some(mmap_args) = self.mmap_in_progress.take() {
+                        self.handle_mmap_exit(mmap_args)?;
+                    }
+
+                    Ok(TraceeState::StoppedAtSystemCallExit(self))
+                }
             }
             _ => {
                 let registers = ptrace::getregs(self.pid)?;
@@ -138,6 +154,8 @@ impl Tracee {
                         // in progress so we put it back.
                         self.int3_trap_in_progress = Some(int3_trap_in_progress);
                     } else {
+                        // We have single stepped past the breakpoint, so we need
+                        // to write back the int3 for next time.
                         unsafe {
                             ptrace::write(
                                 self.pid,
@@ -145,10 +163,49 @@ impl Tracee {
                                 int3_trap_in_progress.instruction as *mut c_void,
                             )?;
                         }
+                        // The fact that we stopped here is an implementation detail
+                        // of how functoin breakpoints are set, so there isn't likely
+                        // to be anything useful for users of this library to do here.
+                        return Ok(TraceeState::Alive(self));
                     }
-                } else {
-                    self.handle_trap(registers)?;
                 }
+                if let Some(traced_function) = self
+                    .resolved_functions
+                    .iter()
+                    // When we stop, the instruction pointer will be on the instruction
+                    // after our int3, so we subtract one from the instruction pointer
+                    // before doing the comparison.
+                    .find(|f| f.virtual_addr == registers.rip - 1)
+                {
+                    unsafe {
+                        ptrace::write(
+                            self.pid,
+                            traced_function.virtual_addr as *mut c_void,
+                            traced_function.original_instruction as *mut c_void,
+                        )?;
+                    }
+                    // need to move pc back by 1 here
+                    let mut registers = registers;
+                    registers.rip -= 1;
+                    ptrace::setregs(self.pid, registers)?;
+
+                    // Setting this trap in progress tells Self::step to single
+                    // step until we move past this address and can write the
+                    // modified instruction back into its place.
+                    self.int3_trap_in_progress = Some(Int3TrapInProgress {
+                        addr: traced_function.virtual_addr,
+                        instruction: traced_function.modified_instruction(),
+                    });
+
+                    let traced_function_name = traced_function.name.clone();
+                    return Ok(TraceeState::StoppedAtFunctionEntrace(
+                        self,
+                        traced_function_name,
+                    ));
+                }
+
+                // If we get here, we stopped for what is at this point an
+                // unknown / unhandled reason.
                 Ok(TraceeState::Alive(self))
             }
         }
@@ -211,57 +268,6 @@ impl Tracee {
             })
             .collect();
 
-        Ok(())
-    }
-    fn handle_trap(&mut self, mut registers: user_regs_struct) -> Result<()> {
-        if let Some(traced_function) = self
-            .resolved_functions
-            .iter()
-            // When we stop, the instruction pointer will be on the instruction
-            // after our int3, so we subtract one from the instruction pointer
-            // before doing the comparison.
-            .find(|f| f.virtual_addr == registers.rip - 1)
-        {
-            println!("[lib] {}", &traced_function.name);
-            unsafe {
-                ptrace::write(
-                    self.pid,
-                    traced_function.virtual_addr as *mut c_void,
-                    traced_function.original_instruction as *mut c_void,
-                )?;
-            }
-            // need to move pc back by 1 here
-            registers.rip -= 1;
-            ptrace::setregs(self.pid, registers)?;
-
-            // Setting this trap in progress tells Self::step to single
-            // step until we move past this address and can write the
-            // modified instruction back into its place.
-            self.int3_trap_in_progress = Some(Int3TrapInProgress {
-                addr: traced_function.virtual_addr,
-                instruction: traced_function.modified_instruction(),
-            });
-        }
-        Ok(())
-    }
-
-    fn possibly_trace_syscall(&self, registers: &user_regs_struct) -> Result<()> {
-        if registers.rax == SYSCALL_ENTRY_MARKER {
-            let name = syscall_name(registers.orig_rax)
-                .map(|s| s.to_string())
-                .unwrap_or(format!("SYS_UNKNOWN_{}", registers.orig_rax));
-
-            let should_trace = match &self.syscalls_to_trace {
-                SyscallsToTrace::All => true,
-                SyscallsToTrace::These(syscalls_to_trace) if syscalls_to_trace.contains(&name) => {
-                    true
-                }
-                _ => false,
-            };
-            if should_trace {
-                println!("[sys] {}", name);
-            }
-        }
         Ok(())
     }
 }

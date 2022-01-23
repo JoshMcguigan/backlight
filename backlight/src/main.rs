@@ -1,8 +1,16 @@
-use backlight_lib::{find_undefined_symbols, Result, SyscallsToTrace, Tracee, TraceeState};
+use backlight_lib::{find_undefined_symbols, Result, Tracee, TraceeState};
 use clap::Parser;
 
 mod args;
 use args::Args;
+
+enum SyscallsToTrace {
+    All,
+    /// Names of the syscalls the user would like to trace.
+    ///
+    /// This can be empty, in which case we will not trace any syscalls.
+    These(Vec<String>),
+}
 
 fn main() -> Result<()> {
     let Args {
@@ -26,32 +34,41 @@ fn main() -> Result<()> {
             )
         };
 
-    let mut tracee = match Tracee::init(
-        &binary_to_trace,
-        &tracee_args,
-        library_functions_to_trace,
-        syscalls_to_trace,
-    )? {
-        TraceeState::Alive(t) => t,
-        TraceeState::Exited(code) => {
-            print_child_process_exited_message(code);
-            return Ok(());
-        }
-    };
+    let mut tracee = Tracee::init(&binary_to_trace, &tracee_args, library_functions_to_trace)?;
 
     loop {
         tracee = match tracee.step()? {
             TraceeState::Alive(t) => t,
+            TraceeState::StoppedAtSystemCallEntrance(t, syscall_name) => {
+                // We break at all system calls, so before logging that we hit
+                // one we first check if we want to trace this particular system
+                // call.
+                let should_trace = match syscalls_to_trace {
+                    SyscallsToTrace::All => true,
+                    SyscallsToTrace::These(ref syscalls_to_trace) => {
+                        syscalls_to_trace.contains(&syscall_name)
+                    }
+                };
+                if should_trace {
+                    println!("[sys] {}", syscall_name);
+                }
+
+                t
+            }
+            TraceeState::StoppedAtSystemCallExit(t) => t,
+            TraceeState::StoppedAtFunctionEntrace(t, func_name) => {
+                // Unlike system calls above, we only break at functions which
+                // we have explicitly asked for, so we always want to log here.
+                println!("[lib] {}", func_name);
+
+                t
+            }
             TraceeState::Exited(code) => {
-                print_child_process_exited_message(code);
+                println!("--- Child process exited with status code {} ---", code);
                 return Ok(());
             }
         }
     }
-}
-
-fn print_child_process_exited_message(code: i32) {
-    println!("--- Child process exited with status code {} ---", code);
 }
 
 #[cfg(test)]
