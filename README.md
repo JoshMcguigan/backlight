@@ -38,6 +38,12 @@ $ backlight -l malloc -l free /bin/ls
 
 # Add args after `--` and backlight will pass them along to the tracee
 $ backlight /bin/ls -- -a
+
+# Trace specific system calls and all shared library function calls
+$ backlight -s sys_openat --all-library-functions /bin/ls
+
+# Trace specific shared library function calls and all system calls
+$ backlight -l malloc --all-syscalls /bin/ls
 ```
 
 I'm looking for feedback on the UX of backlight. Stop by [#3](https://github.com/JoshMcguigan/backlight/issues/3) and share your opinions!

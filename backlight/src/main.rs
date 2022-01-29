@@ -2,7 +2,7 @@ use backlight_lib::{find_undefined_symbols, Result, Tracee, TraceeState};
 use clap::Parser;
 
 mod args;
-use args::Args;
+use args::{Args, TraceRequest};
 
 enum SyscallsToTrace {
     All,
@@ -13,25 +13,50 @@ enum SyscallsToTrace {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let library_function_trace_request = args.library_function_trace_request();
+    let syscall_trace_request = args.syscall_trace_request();
+
     let Args {
         binary_to_trace,
-        library_functions_to_trace,
-        syscalls_to_trace,
         tracee_args,
-    } = Args::parse();
+        ..
+    } = args;
 
-    // If the user doesn't specify what they want to trace we trace everything.
     let (library_functions_to_trace, syscalls_to_trace) =
-        if library_functions_to_trace.is_empty() && syscalls_to_trace.is_empty() {
-            (
+        match (library_function_trace_request, syscall_trace_request) {
+            (TraceRequest::All, TraceRequest::All) => (
                 find_undefined_symbols(&binary_to_trace)?,
                 SyscallsToTrace::All,
-            )
-        } else {
-            (
-                library_functions_to_trace,
+            ),
+            (TraceRequest::All, TraceRequest::These(syscalls_to_trace)) => (
+                find_undefined_symbols(&binary_to_trace)?,
                 SyscallsToTrace::These(syscalls_to_trace),
-            )
+            ),
+            (TraceRequest::All, TraceRequest::NoSpecificRequest) => (
+                find_undefined_symbols(&binary_to_trace)?,
+                SyscallsToTrace::These(vec![]),
+            ),
+            (TraceRequest::These(functions_to_trace), TraceRequest::All) => {
+                (functions_to_trace, SyscallsToTrace::All)
+            }
+            (TraceRequest::These(functions_to_trace), TraceRequest::These(syscalls_to_trace)) => (
+                functions_to_trace,
+                SyscallsToTrace::These(syscalls_to_trace),
+            ),
+            (TraceRequest::These(functions_to_trace), TraceRequest::NoSpecificRequest) => {
+                (functions_to_trace, SyscallsToTrace::These(vec![]))
+            }
+            (TraceRequest::NoSpecificRequest, TraceRequest::All) => (vec![], SyscallsToTrace::All),
+            (TraceRequest::NoSpecificRequest, TraceRequest::These(syscalls_to_trace)) => {
+                (vec![], SyscallsToTrace::These(syscalls_to_trace))
+            }
+            // If the user doesn't specify what they want to trace we trace everything.
+            (TraceRequest::NoSpecificRequest, TraceRequest::NoSpecificRequest) => (
+                find_undefined_symbols(&binary_to_trace)?,
+                SyscallsToTrace::All,
+            ),
         };
 
     let mut tracee = Tracee::init(&binary_to_trace, &tracee_args, library_functions_to_trace)?;
@@ -222,6 +247,24 @@ mod tests {
                 std err:
 
             "#]],
+        );
+    }
+
+    #[test]
+    fn traces_syscall_and_all_library_functions() {
+        assert_trace_contains(
+            "test_support_abs",
+            &["-s", "sys_exit_group", "--all-library-functions"],
+            &["[sys] sys_exit_group", "[lib] abs"],
+        );
+    }
+
+    #[test]
+    fn traces_library_function_and_all_syscalls() {
+        assert_trace_contains(
+            "test_support_abs",
+            &["-l", "abs", "--all-syscalls"],
+            &["[sys] sys_exit_group", "[lib] abs"],
         );
     }
 
