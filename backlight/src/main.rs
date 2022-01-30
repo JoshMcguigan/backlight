@@ -108,6 +108,9 @@ mod tests {
         cargo_build(bin_name);
 
         let output = Command::new("../target/debug/backlight")
+            // This links allows linking against our test support lib, generated
+            // in test_support/build.rs.
+            .env("LD_LIBRARY_PATH", "../target")
             .arg(&format!("../target/debug/{}", bin_name))
             .args(trace_args)
             .output()
@@ -133,6 +136,9 @@ mod tests {
         cargo_build(bin_name);
 
         let output = Command::new("../target/debug/backlight")
+            // This links allows linking against our test support lib, generated
+            // in test_support/build.rs.
+            .env("LD_LIBRARY_PATH", "../target")
             .arg(&format!("../target/debug/{}", bin_name))
             .args(trace_args)
             .output()
@@ -172,6 +178,28 @@ mod tests {
                 [lib] abs
                 [lib] abs
                 [lib] abs
+                --- Child process exited with status code 0 ---
+
+                std err:
+
+            "#]],
+        );
+    }
+
+    #[test]
+    fn traces_nested_function_call_exit() {
+        test_trace(
+            "test_support_nested_function_calls",
+            &["-l", "calls_foo", "-l", "foo", "--trace-function-exit"],
+            expect![[r#"
+                status code: 0
+
+                std out:
+                [lib] calls_foo {
+                [lib]   foo {
+                [lib]   }
+                [lib] }
+
                 --- Child process exited with status code 0 ---
 
                 std err:

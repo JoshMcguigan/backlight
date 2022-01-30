@@ -12,6 +12,8 @@ pub struct Args {
     pub syscalls_to_trace: Vec<String>,
     #[clap(long = "all-syscalls")]
     pub trace_all_syscalls: bool,
+    #[clap(long = "trace-function-exit")]
+    pub trace_function_exit: bool,
     pub tracee_args: Vec<String>,
 }
 
